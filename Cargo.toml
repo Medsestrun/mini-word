@@ -1,0 +1,43 @@
+[package]
+name = "mini-word"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Efficient small vectors for inline storage
+smallvec = "1.11"
+# Fast hashing
+rustc-hash = "1.1"
+# Unicode segmentation for grapheme clusters
+unicode-segmentation = "1.10"
+# Unicode line breaking
+unicode-linebreak = "0.1"
+# WASM bindings
+wasm-bindgen = "0.2"
+# JavaScript interop
+js-sys = "0.3"
+# Serialization for JS communication
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde-wasm-bindgen = "0.6"
+# Console logging for WASM
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+wasm-bindgen-test = "0.3"
+
+[features]
+default = ["console_error_panic_hook"]
+
+[[bench]]
+name = "benchmarks"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
