@@ -1,81 +1,50 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import './App.css';
+import {
+  type RenderData,
+  type PageRenderData,
+  type LineRenderData,
+  type CursorRenderData,
+  type SelectionRenderData,
+  type LayoutConstraints,
+  type WasmEditorInterface,
+  getRenderDataFromEditor,
+  getLayoutConstraints,
+} from './renderDecoder';
 
-// Types matching Rust WASM exports
-interface RenderData {
-  version: number;
-  pages: PageRenderData[];
-  cursor: CursorRenderData | null;
-  selections: SelectionRenderData[];
-}
+// Text measurement utilities for accurate cursor positioning
+const measureTextWidth = (() => {
+  let canvas: HTMLCanvasElement | null = null;
+  let ctx: CanvasRenderingContext2D | null = null;
+  
+  return (text: string, font: string): number => {
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+      ctx = canvas.getContext('2d');
+    }
+    if (!ctx) return 0;
+    ctx.font = font;
+    return ctx.measureText(text).width;
+  };
+})();
 
-interface PageRenderData {
-  pageIndex: number;
-  yOffset: number;
-  width: number;
-  height: number;
-  lines: LineRenderData[];
-}
-
-interface LineRenderData {
-  x: number;
-  y: number;
-  text: string;
-  blockType: string;
-  isHeading: boolean;
-  headingLevel: number | null;
-  isListItem: boolean;
-  listMarker: string | null;
-}
-
-interface CursorRenderData {
-  x: number;
-  y: number;
-  height: number;
-  pageIndex: number;
-}
-
-interface SelectionRenderData {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  pageIndex: number;
-}
-
-interface LayoutConstraints {
-  pageWidth: number;
-  pageHeight: number;
-  marginTop: number;
-  marginBottom: number;
-  marginLeft: number;
-  marginRight: number;
-  contentWidth: number;
-  contentHeight: number;
-}
-
-interface WasmEditor {
-  insertText(text: string): void;
-  deleteBackward(): boolean;
-  deleteForward(): boolean;
-  moveCursor(horizontal: number, vertical: number, extendSelection: boolean): void;
-  undo(): boolean;
-  redo(): boolean;
-  getText(): string;
-  getPageCount(): number;
-  getRenderData(viewportY: number, viewportHeight: number): RenderData;
-  getCursorInfo(): { paraId: number; offset: number; hasSelection: boolean };
-  getLayoutConstraints(): LayoutConstraints;
-  selectAll(): void;
-  clearSelection(): void;
-  insertParagraph(): void;
-}
+// Get font string for a line
+const getFontForLine = (line: LineRenderData, scale: number): string => {
+  const weight = line.isHeading ? 700 : 400;
+  let size = 14;
+  if (line.isHeading && line.headingLevel) {
+    const sizes: Record<number, number> = { 1: 24, 2: 20, 3: 18, 4: 16, 5: 14, 6: 13 };
+    size = sizes[line.headingLevel] || 14;
+  }
+  return `${weight} ${size * scale}px Georgia, "Times New Roman", serif`;
+};
 
 const PAGE_GAP = 20;
 const SCALE = 1;
 
 function App() {
-  const [editor, setEditor] = useState<WasmEditor | null>(null);
+  const [editor, setEditor] = useState<WasmEditorInterface | null>(null);
+  const [wasmMemory, setWasmMemory] = useState<WebAssembly.Memory | null>(null);
   const [renderData, setRenderData] = useState<RenderData | null>(null);
   const [constraints, setConstraints] = useState<LayoutConstraints | null>(null);
   const [cursorVisible, setCursorVisible] = useState(true);
@@ -88,10 +57,15 @@ function App() {
       try {
         const wasm = await import('../../pkg/mini_word.js');
         await wasm.default();
-        const ed = new wasm.WasmEditor();
+        
+        // Get WASM memory for zero-copy access
+        const memory = wasm.getWasmMemory() as WebAssembly.Memory;
+        setWasmMemory(memory);
+
+        const ed = new wasm.WasmEditor() as WasmEditorInterface;
         setEditor(ed);
-        setConstraints(ed.getLayoutConstraints());
-        updateRenderData(ed);
+        setConstraints(getLayoutConstraints(ed));
+        updateRenderData(ed, memory);
       } catch (err) {
         console.error('Failed to load WASM:', err);
       }
@@ -99,8 +73,8 @@ function App() {
     loadWasm();
   }, []);
 
-  const updateRenderData = useCallback((ed: WasmEditor) => {
-    const data = ed.getRenderData(0, 10000);
+  const updateRenderData = useCallback((ed: WasmEditorInterface, memory: WebAssembly.Memory) => {
+    const data = getRenderDataFromEditor(ed, memory, 0, 10000);
     setRenderData(data);
   }, []);
 
@@ -115,12 +89,11 @@ function App() {
   // Handle keyboard input
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      if (!editor) return;
+      if (!editor || !wasmMemory) return;
 
       const isCtrl = e.ctrlKey || e.metaKey;
       const isShift = e.shiftKey;
 
-      // Prevent default for handled keys
       let handled = true;
 
       if (isCtrl && e.key === 'z') {
@@ -156,10 +129,10 @@ function App() {
       if (handled) {
         e.preventDefault();
         setCursorVisible(true);
-        updateRenderData(editor);
+        updateRenderData(editor, wasmMemory);
       }
     },
-    [editor, updateRenderData]
+    [editor, wasmMemory, updateRenderData]
   );
 
   // Focus on click
@@ -167,7 +140,7 @@ function App() {
     editorRef.current?.focus();
   }, []);
 
-  if (!editor || !constraints) {
+  if (!editor || !constraints || !wasmMemory) {
     return (
       <div className="loading">
         <div className="loading-spinner" />
@@ -191,9 +164,11 @@ function App() {
             className="toolbar-btn"
             onClick={() => {
               editor.undo();
-              updateRenderData(editor);
+              updateRenderData(editor, wasmMemory);
             }}
             title="Undo (Ctrl+Z)"
+            aria-label="Undo"
+            tabIndex={0}
           >
             ↶
           </button>
@@ -201,9 +176,11 @@ function App() {
             className="toolbar-btn"
             onClick={() => {
               editor.redo();
-              updateRenderData(editor);
+              updateRenderData(editor, wasmMemory);
             }}
             title="Redo (Ctrl+Y)"
+            aria-label="Redo"
+            tabIndex={0}
           >
             ↷
           </button>
@@ -222,6 +199,9 @@ function App() {
           className="editor-area"
           ref={editorRef}
           tabIndex={0}
+          role="textbox"
+          aria-multiline="true"
+          aria-label="Document editor"
           onKeyDown={handleKeyDown}
           onClick={handleClick}
           style={{ height: totalHeight + 40 }}
@@ -294,6 +274,38 @@ function Page({
 }: PageProps) {
   const pageTop = page.pageIndex * (constraints.pageHeight + pageGap) * scale + pageGap;
 
+  // Calculate accurate cursor X position using text measurement
+  const cursorX = useMemo(() => {
+    if (!cursor) return 0;
+    
+    // Find the line the cursor is on by matching Y position
+    const cursorLine = page.lines.find(line => Math.abs(line.y - cursor.y) < 1);
+    if (!cursorLine) {
+      console.log('[Cursor] No line found, using Rust X:', cursor.x);
+      return cursor.x; // Fallback to Rust-calculated position
+    }
+    
+    // Measure the text up to the cursor position using unscaled font (same as render)
+    const textBeforeCursor = cursorLine.text.slice(0, cursor.lineCharOffset);
+    // Use unscaled font for measurement, since we measure in document coords
+    const font = getFontForLine(cursorLine, 1); // Use scale=1 for document-space measurement
+    const measuredWidth = measureTextWidth(textBeforeCursor, font);
+    
+    console.log('[Cursor]', {
+      lineText: `"${cursorLine.text}"`,
+      lineTextLen: cursorLine.text.length,
+      lineCharOffset: cursor.lineCharOffset,
+      textBeforeCursor: `"${textBeforeCursor}"`,
+      font,
+      measuredWidth,
+      lineX: cursorLine.x,
+      result: cursorLine.x + measuredWidth,
+    });
+    
+    // cursorLine.x is in document space, measuredWidth is now also in document space
+    return cursorLine.x + measuredWidth;
+  }, [cursor, page.lines]);
+
   return (
     <div
       className="page"
@@ -337,7 +349,7 @@ function Page({
           className="cursor"
           style={{
             position: 'absolute',
-            left: cursor.x * scale,
+            left: cursorX * scale,
             top: cursor.y * scale,
             width: 2,
             height: cursor.height * scale,

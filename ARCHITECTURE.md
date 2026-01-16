@@ -187,18 +187,46 @@ Each operation has an inverse computed at apply time:
 
 ## WASM Bridge
 
-### Serialization
+### Zero-Copy Flat Buffer Protocol
 
-Render data is serialized to JavaScript via `serde-wasm-bindgen`:
+Instead of using JSON serialization via `serde-wasm-bindgen`, render data uses flat typed arrays for zero-copy transfer:
 
 ```rust
-#[derive(Serialize)]
-struct RenderData {
-    version: u64,
-    pages: Vec<PageRenderData>,
-    cursor: Option<CursorRenderData>,
-    selections: Vec<SelectionRenderData>,
+pub struct RenderBuffer {
+    /// Integer data (indices, counts, offsets, opcodes)
+    pub u32_data: Vec<u32>,
+    /// Float data (positions, dimensions)
+    pub f32_data: Vec<f32>,
+    /// UTF-8 text buffer
+    pub text_data: Vec<u8>,
 }
+```
+
+### Binary Protocol Layout
+
+**u32 Buffer Header:**
+```text
+[0] version_lo
+[1] version_hi
+[2] page_count
+[3] cursor_present (0 or 1)
+[4] selection_count
+[5] text_buffer_len
+```
+
+**Per-page data (u32):**
+```text
+page_index
+line_count
+per-line: [text_offset, text_len, block_type, flags, marker_offset, marker_len]
+```
+
+**f32 Buffer:**
+```text
+per-page: [y_offset, width, height]
+per-line: [x, y]
+cursor (if present): [x, y, height, page_index]
+per-selection: [x, y, width, height, page_index]
 ```
 
 ### API Surface
@@ -206,6 +234,7 @@ struct RenderData {
 ```rust
 #[wasm_bindgen]
 impl WasmEditor {
+    // Editing
     pub fn new() -> Self;
     pub fn insert_text(&mut self, text: &str);
     pub fn delete_backward(&mut self) -> bool;
@@ -213,10 +242,44 @@ impl WasmEditor {
     pub fn move_cursor(&mut self, h: i32, v: i32, extend: bool);
     pub fn undo(&mut self) -> bool;
     pub fn redo(&mut self) -> bool;
-    pub fn get_render_data(&self, y: f32, h: f32) -> JsValue;
     pub fn get_text(&self) -> String;
     pub fn get_page_count(&self) -> usize;
+    
+    // Zero-copy buffer API
+    pub fn build_render_data(&mut self, viewport_y: f32, viewport_height: f32);
+    pub fn get_u32_ptr(&self) -> *const u32;
+    pub fn get_u32_len(&self) -> usize;
+    pub fn get_f32_ptr(&self) -> *const f32;
+    pub fn get_f32_len(&self) -> usize;
+    pub fn get_text_ptr(&self) -> *const u8;
+    pub fn get_text_len(&self) -> usize;
+    
+    // Direct constraint accessors (no serialization)
+    pub fn get_page_width(&self) -> f32;
+    pub fn get_page_height(&self) -> f32;
+    // ... etc
 }
+```
+
+### TypeScript Decoder
+
+The frontend uses a decoder that reads directly from WASM memory:
+
+```typescript
+const decodeRenderData = (
+  memory: WebAssembly.Memory,
+  u32Ptr: number,
+  u32Len: number,
+  f32Ptr: number,
+  f32Len: number,
+  textPtr: number,
+  textLen: number
+): RenderData => {
+  const u32View = new Uint32Array(memory.buffer, u32Ptr, u32Len);
+  const f32View = new Float32Array(memory.buffer, f32Ptr, f32Len);
+  const textView = new Uint8Array(memory.buffer, textPtr, textLen);
+  // ... decode
+};
 ```
 
 ---

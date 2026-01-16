@@ -61,6 +61,8 @@ pub enum DisplayItem {
     Caret {
         position: Point,
         height: f32,
+        /// Character offset within the line (for frontend text measurement)
+        line_char_offset: usize,
     },
     /// Selection highlight
     SelectionRect {
@@ -230,7 +232,7 @@ impl DisplayList {
             }
 
             // Cursor
-            if let Some(caret_pos) = Self::cursor_position(
+            if let Some((caret_pos, line_char_offset)) = Self::cursor_position(
                 document,
                 layout,
                 cursor,
@@ -240,6 +242,7 @@ impl DisplayList {
                 items.push(DisplayItem::Caret {
                     position: caret_pos,
                     height: crate::layout::LINE_HEIGHT,
+                    line_char_offset,
                 });
             }
 
@@ -262,13 +265,14 @@ impl DisplayList {
     }
 
     /// Calculate cursor position on page
+    /// Returns (Point, line_char_offset) where line_char_offset is the character position within the line
     fn cursor_position(
         document: &Document,
         layout: &LayoutState,
         cursor: &Cursor,
         page: &crate::layout::PageLayout,
         constraints: &crate::layout::LayoutConstraints,
-    ) -> Option<Point> {
+    ) -> Option<(Point, usize)> {
         // Check if cursor is on this page
         if cursor.position.para_id < page.start_para 
             || cursor.position.para_id > page.end_para 
@@ -286,6 +290,9 @@ impl DisplayList {
         if cursor.position.para_id == page.end_para && line_idx > page.end_line {
             return None;
         }
+
+        // Calculate character offset within line
+        let line_char_offset = cursor.position.offset.saturating_sub(line.byte_range.start);
 
         // Calculate Y position
         let mut y = constraints.margin_top;
@@ -328,7 +335,7 @@ impl DisplayList {
                         let x = constraints.margin_left + indent + 
                             line.x_for_offset(cursor.position.offset);
                         
-                        return Some(Point { x, y });
+                        return Some((Point { x, y }, line_char_offset));
                     }
 
                     y += ln.height;

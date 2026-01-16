@@ -1,8 +1,19 @@
 //! WASM bindings for the editor
+//!
+//! Provides a zero-copy bridge using flat typed arrays instead of JSON serialization.
+
+pub mod flat_buffer;
 
 use wasm_bindgen::prelude::*;
-use serde::{Deserialize, Serialize};
+use crate::document::BlockKind;
 use crate::{Editor, LayoutConstraints, Rect};
+use flat_buffer::{RenderBuffer, block_kind_to_opcode};
+
+/// Get access to WASM memory for zero-copy data access
+#[wasm_bindgen(js_name = getWasmMemory)]
+pub fn get_wasm_memory() -> JsValue {
+    wasm_bindgen::memory()
+}
 
 /// Initialize panic hook for better error messages
 #[wasm_bindgen(start)]
@@ -11,10 +22,11 @@ pub fn init() {
     console_error_panic_hook::set_once();
 }
 
-/// WASM-exposed editor wrapper
+/// WASM-exposed editor wrapper with zero-copy render buffer
 #[wasm_bindgen]
 pub struct WasmEditor {
     editor: Editor,
+    render_buffer: RenderBuffer,
 }
 
 #[wasm_bindgen]
@@ -32,10 +44,12 @@ impl WasmEditor {
         };
 
         let mut editor = Editor::new(constraints);
-        // Initialize layout for the empty document
         editor.update_layout();
         
-        Self { editor }
+        Self { 
+            editor,
+            render_buffer: RenderBuffer::new(),
+        }
     }
 
     /// Create editor with custom page dimensions
@@ -58,10 +72,12 @@ impl WasmEditor {
         };
 
         let mut editor = Editor::new(constraints);
-        // Initialize layout for the empty document
         editor.update_layout();
         
-        Self { editor }
+        Self { 
+            editor,
+            render_buffer: RenderBuffer::new(),
+        }
     }
 
     /// Insert text at current cursor position
@@ -127,54 +143,12 @@ impl WasmEditor {
         self.editor.page_count()
     }
 
-    /// Get render data for a viewport (returns JSON)
-    #[wasm_bindgen(js_name = getRenderData)]
-    pub fn get_render_data(&self, viewport_y: f32, viewport_height: f32) -> JsValue {
-        let viewport = Rect::new(0.0, viewport_y, 816.0, viewport_height);
-        let display_list = self.editor.build_display_list(viewport);
-        
-        let render_data = RenderData::from_display_list(&display_list, &self.editor);
-        
-        serde_wasm_bindgen::to_value(&render_data).unwrap_or(JsValue::NULL)
-    }
-
-    /// Get cursor position info (returns JSON)
-    #[wasm_bindgen(js_name = getCursorInfo)]
-    pub fn get_cursor_info(&self) -> JsValue {
-        let cursor_info = CursorInfo {
-            para_id: self.editor.cursor.position.para_id.0,
-            offset: self.editor.cursor.position.offset,
-            has_selection: self.editor.selection.is_some(),
-        };
-        
-        serde_wasm_bindgen::to_value(&cursor_info).unwrap_or(JsValue::NULL)
-    }
-
-    /// Get layout constraints
-    #[wasm_bindgen(js_name = getLayoutConstraints)]
-    pub fn get_layout_constraints(&self) -> JsValue {
-        let constraints = LayoutConstraintsJS {
-            page_width: self.editor.layout.constraints().page_width,
-            page_height: self.editor.layout.constraints().page_height,
-            margin_top: self.editor.layout.constraints().margin_top,
-            margin_bottom: self.editor.layout.constraints().margin_bottom,
-            margin_left: self.editor.layout.constraints().margin_left,
-            margin_right: self.editor.layout.constraints().margin_right,
-            content_width: self.editor.layout.constraints().content_width(),
-            content_height: self.editor.layout.constraints().content_height(),
-        };
-        
-        serde_wasm_bindgen::to_value(&constraints).unwrap_or(JsValue::NULL)
-    }
-
     /// Select all text
     #[wasm_bindgen(js_name = selectAll)]
     pub fn select_all(&mut self) {
-        // Move to start
         while self.editor.cursor.position.offset > 0 || self.editor.cursor.position.para_id.0 > 0 {
             self.editor.move_cursor(-1, 0, false);
         }
-        // Extend selection to end
         let text_len = self.editor.text().len();
         for _ in 0..text_len {
             self.editor.move_cursor(1, 0, true);
@@ -192,165 +166,196 @@ impl WasmEditor {
     pub fn insert_paragraph(&mut self) {
         self.insert_text("\n");
     }
-}
 
-impl Default for WasmEditor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+    // =========================================================================
+    // Zero-copy render buffer API
+    // =========================================================================
 
-/// Serializable render data for JS
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RenderData {
-    pub version: u64,
-    pub pages: Vec<PageRenderData>,
-    pub cursor: Option<CursorRenderData>,
-    pub selections: Vec<SelectionRenderData>,
-}
+    /// Build render data into internal buffers for the given viewport.
+    /// Call this before accessing the buffer pointers.
+    #[wasm_bindgen(js_name = buildRenderData)]
+    pub fn build_render_data(&mut self, viewport_y: f32, viewport_height: f32) {
+        let viewport = Rect::new(0.0, viewport_y, 816.0, viewport_height);
+        let display_list = self.editor.build_display_list(viewport);
+        let constraints = self.editor.layout.constraints();
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PageRenderData {
-    pub page_index: usize,
-    pub y_offset: f32,
-    pub width: f32,
-    pub height: f32,
-    pub lines: Vec<LineRenderData>,
-}
+        self.render_buffer.clear();
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LineRenderData {
-    pub x: f32,
-    pub y: f32,
-    pub text: String,
-    pub block_type: String,
-    pub is_heading: bool,
-    pub heading_level: Option<u8>,
-    pub is_list_item: bool,
-    pub list_marker: Option<String>,
-}
+        // Write header
+        self.render_buffer.write_header(
+            display_list.version,
+            display_list.pages.len() as u32,
+        );
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CursorRenderData {
-    pub x: f32,
-    pub y: f32,
-    pub height: f32,
-    pub page_index: usize,
-}
+        // Collect cursor and selections separately - they must be written AFTER all pages/lines
+        // to maintain the expected f32 buffer layout
+        // cursor_data: (x, y, height, page_index, line_char_offset)
+        let mut cursor_data: Option<(f32, f32, f32, usize, usize)> = None;
+        let mut selections: Vec<(f32, f32, f32, f32, usize)> = Vec::new();
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SelectionRenderData {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-    pub page_index: usize,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CursorInfo {
-    pub para_id: u64,
-    pub offset: usize,
-    pub has_selection: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LayoutConstraintsJS {
-    pub page_width: f32,
-    pub page_height: f32,
-    pub margin_top: f32,
-    pub margin_bottom: f32,
-    pub margin_left: f32,
-    pub margin_right: f32,
-    pub content_width: f32,
-    pub content_height: f32,
-}
-
-impl RenderData {
-    fn from_display_list(display_list: &crate::render::DisplayList, editor: &Editor) -> Self {
-        use crate::render::DisplayItem;
-        use crate::document::BlockKind;
-
-        let constraints = editor.layout.constraints();
-        let mut pages = Vec::new();
-        let mut cursor = None;
-        let mut selections = Vec::new();
-
+        // First pass: write pages and lines, collect cursor and selections
         for page in &display_list.pages {
-            let mut lines = Vec::new();
+            let page_y = page.page_index as f32 * constraints.page_height;
+            let line_count_idx = self.render_buffer.begin_page(
+                page.page_index,
+                page_y,
+                constraints.page_width,
+                constraints.page_height,
+            );
+
+            let mut line_count: u32 = 0;
 
             for item in &page.items {
                 match item {
-                    DisplayItem::TextRun { position, text, block_kind, .. } => {
-                        let (is_heading, heading_level) = match block_kind {
-                            BlockKind::Heading { level } => (true, Some(*level)),
-                            _ => (false, None),
+                    crate::render::DisplayItem::TextRun { position, text, block_kind, .. } => {
+                        let (block_type, flags) = block_kind_to_opcode(block_kind);
+                        
+                        let list_marker = if let BlockKind::ListItem { marker, .. } = block_kind {
+                            Some(marker.display())
+                        } else {
+                            None
                         };
 
-                        let (is_list_item, list_marker) = match block_kind {
-                            BlockKind::ListItem { marker, .. } => {
-                                (true, Some(marker.display()))
-                            }
-                            _ => (false, None),
-                        };
-
-                        lines.push(LineRenderData {
-                            x: position.x,
-                            y: position.y,
-                            text: text.clone(),
-                            block_type: match block_kind {
-                                BlockKind::Paragraph => "paragraph".to_string(),
-                                BlockKind::Heading { level } => format!("heading-{}", level),
-                                BlockKind::ListItem { .. } => "list-item".to_string(),
-                            },
-                            is_heading,
-                            heading_level,
-                            is_list_item,
-                            list_marker,
-                        });
+                        self.render_buffer.write_line(
+                            position.x,
+                            position.y,
+                            text,
+                            block_type,
+                            flags,
+                            list_marker.as_deref(),
+                        );
+                        line_count += 1;
                     }
-                    DisplayItem::Caret { position, height } => {
-                        cursor = Some(CursorRenderData {
-                            x: position.x,
-                            y: position.y,
-                            height: *height,
-                            page_index: page.page_index,
-                        });
+                    crate::render::DisplayItem::Caret { position, height, line_char_offset } => {
+                        // Collect cursor data to write after all pages
+                        cursor_data = Some((position.x, position.y, *height, page.page_index, *line_char_offset));
                     }
-                    DisplayItem::SelectionRect { rect } => {
-                        selections.push(SelectionRenderData {
-                            x: rect.x,
-                            y: rect.y,
-                            width: rect.width,
-                            height: rect.height,
-                            page_index: page.page_index,
-                        });
+                    crate::render::DisplayItem::SelectionRect { rect } => {
+                        // Collect selection data to write after all pages
+                        selections.push((rect.x, rect.y, rect.width, rect.height, page.page_index));
                     }
                     _ => {}
                 }
             }
 
-            pages.push(PageRenderData {
-                page_index: page.page_index,
-                y_offset: page.page_index as f32 * constraints.page_height,
-                width: constraints.page_width,
-                height: constraints.page_height,
-                lines,
-            });
+            self.render_buffer.set_line_count(line_count_idx, line_count);
         }
 
-        RenderData {
-            version: display_list.version,
-            pages,
-            cursor,
-            selections,
+        // Second pass: write cursor and selections after all pages/lines
+        if let Some((x, y, height, page_index, line_char_offset)) = cursor_data {
+            self.render_buffer.write_cursor(x, y, height, page_index, line_char_offset);
         }
+
+        for (x, y, width, height, page_index) in &selections {
+            self.render_buffer.write_selection(*x, *y, *width, *height, *page_index);
+        }
+
+        self.render_buffer.set_selection_count(selections.len() as u32);
+        self.render_buffer.finalize();
+    }
+
+    /// Get pointer to u32 buffer (call buildRenderData first)
+    #[wasm_bindgen(js_name = getU32Ptr)]
+    pub fn get_u32_ptr(&self) -> *const u32 {
+        self.render_buffer.u32_ptr()
+    }
+
+    /// Get length of u32 buffer
+    #[wasm_bindgen(js_name = getU32Len)]
+    pub fn get_u32_len(&self) -> usize {
+        self.render_buffer.u32_len()
+    }
+
+    /// Get pointer to f32 buffer
+    #[wasm_bindgen(js_name = getF32Ptr)]
+    pub fn get_f32_ptr(&self) -> *const f32 {
+        self.render_buffer.f32_ptr()
+    }
+
+    /// Get length of f32 buffer
+    #[wasm_bindgen(js_name = getF32Len)]
+    pub fn get_f32_len(&self) -> usize {
+        self.render_buffer.f32_len()
+    }
+
+    /// Get pointer to text buffer
+    #[wasm_bindgen(js_name = getTextPtr)]
+    pub fn get_text_ptr(&self) -> *const u8 {
+        self.render_buffer.text_ptr()
+    }
+
+    /// Get length of text buffer
+    #[wasm_bindgen(js_name = getTextLen)]
+    pub fn get_text_len(&self) -> usize {
+        self.render_buffer.text_len()
+    }
+
+    // =========================================================================
+    // Direct accessors for layout constraints (no serialization needed)
+    // =========================================================================
+
+    #[wasm_bindgen(js_name = getPageWidth)]
+    pub fn get_page_width(&self) -> f32 {
+        self.editor.layout.constraints().page_width
+    }
+
+    #[wasm_bindgen(js_name = getPageHeight)]
+    pub fn get_page_height(&self) -> f32 {
+        self.editor.layout.constraints().page_height
+    }
+
+    #[wasm_bindgen(js_name = getMarginTop)]
+    pub fn get_margin_top(&self) -> f32 {
+        self.editor.layout.constraints().margin_top
+    }
+
+    #[wasm_bindgen(js_name = getMarginBottom)]
+    pub fn get_margin_bottom(&self) -> f32 {
+        self.editor.layout.constraints().margin_bottom
+    }
+
+    #[wasm_bindgen(js_name = getMarginLeft)]
+    pub fn get_margin_left(&self) -> f32 {
+        self.editor.layout.constraints().margin_left
+    }
+
+    #[wasm_bindgen(js_name = getMarginRight)]
+    pub fn get_margin_right(&self) -> f32 {
+        self.editor.layout.constraints().margin_right
+    }
+
+    #[wasm_bindgen(js_name = getContentWidth)]
+    pub fn get_content_width(&self) -> f32 {
+        self.editor.layout.constraints().content_width()
+    }
+
+    #[wasm_bindgen(js_name = getContentHeight)]
+    pub fn get_content_height(&self) -> f32 {
+        self.editor.layout.constraints().content_height()
+    }
+
+    // =========================================================================
+    // Cursor info accessors (no serialization needed)
+    // =========================================================================
+
+    #[wasm_bindgen(js_name = getCursorParaId)]
+    pub fn get_cursor_para_id(&self) -> u64 {
+        self.editor.cursor.position.para_id.0
+    }
+
+    #[wasm_bindgen(js_name = getCursorOffset)]
+    pub fn get_cursor_offset(&self) -> usize {
+        self.editor.cursor.position.offset
+    }
+
+    #[wasm_bindgen(js_name = hasSelection)]
+    pub fn has_selection(&self) -> bool {
+        self.editor.selection.is_some()
+    }
+}
+
+impl Default for WasmEditor {
+    fn default() -> Self {
+        Self::new()
     }
 }
