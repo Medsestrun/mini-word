@@ -3,25 +3,46 @@
  * 
  * Binary format:
  * 
- * u32 buffer header:
- * [0] version_lo
- * [1] version_hi
- * [2] page_count
- * [3] cursor_present (0 or 1)
- * [4] selection_count
- * [5] text_buffer_len
+ * u32 buffer:
+ * Header (offset table for random access):
+ *   [0] MAGIC (0x4D575244 = "MWRD" for validation)
+ *   [1] SCHEMA_VERSION (protocol version, currently 1)
+ *   [2] version_lo (document version)
+ *   [3] version_hi (document version)
+ *   [4] page_count
+ *   [5] cursor_present (0 or 1)
+ *   [6] selection_count
+ *   [7] text_buffer_len
+ *   [8] u32_cursor_offset (index where cursor indices start, 0 if no cursor)
+ *   [9] u32_selection_offset (index where selection indices start, 0 if no selections)
+ *   [10] f32_cursor_offset (index where cursor geometry starts, 0 if no cursor)
+ *   [11] f32_selection_offset (index where selection geometries start, 0 if no selections)
  * 
- * Per page in u32:
- * - page_index
- * - line_count
- * - per line: [text_offset, text_len, block_type, flags, marker_offset, marker_len]
+ * Per page (starts at index 12):
+ *   - page_index
+ *   - line_count
+ *   - per line: [text_offset, text_len, text_utf16_offset, text_utf16_len,
+ *               block_type, flags, marker_offset, marker_len, marker_utf16_offset, marker_utf16_len]
+ *     text_offset/text_len: byte offsets in UTF-8 buffer (for validation)
+ *     text_utf16_offset/text_utf16_len: offsets for JS substring (after single decode)
+ *     marker: only read if marker_len > 0, otherwise marker_offset is ignored
+ * 
+ * At u32_cursor_offset (if cursor_present):
+ *   - cursor indices: [page_index, utf16_offset_in_line]
+ * 
+ * At u32_selection_offset (if selection_count > 0):
+ *   - per selection indices: [page_index] (selection_count times)
  * 
  * f32 buffer:
  * - per page: [y_offset, width, height]
  * - per line: [x, y]
- * - cursor (if present): [x, y, height, page_index]
- * - per selection: [x, y, width, height, page_index]
+ * - cursor geometry (if present): [x, y, height]
+ * - per selection geometry: [x, y, width, height] (selection_count times)
  */
+
+// Protocol constants (must match Rust)
+const MAGIC = 0x4D575244; // "MWRD" (MiniWoRD)
+const SCHEMA_VERSION = 1;
 
 // Block type opcodes (must match Rust)
 const BLOCK_PARAGRAPH = 0;
@@ -68,8 +89,8 @@ export interface CursorRenderData {
   y: number;
   height: number;
   pageIndex: number;
-  /** Character offset within the line for frontend text measurement */
-  lineCharOffset: number;
+  /** UTF-16 code unit offset within the line for correct JS text measurement */
+  utf16OffsetInLine: number;
 }
 
 export interface SelectionRenderData {
@@ -96,10 +117,16 @@ const blockTypeToString = (blockType: number): string => {
 
 const getHeadingLevel = (blockType: number): number | null => {
   if (blockType >= BLOCK_HEADING_1 && blockType <= BLOCK_HEADING_6) {
-    return blockType; // 1-6
+    return blockType - BLOCK_HEADING_1 + 1;
   }
   return null;
 };
+
+/**
+ * Reusable TextDecoder instance (created once, reused for all decodes)
+ * PERFORMANCE: Avoids creating new TextDecoder on every render frame
+ */
+const textDecoder = new TextDecoder('utf-8');
 
 /**
  * Decode render data from WASM memory buffers
@@ -118,20 +145,36 @@ export const decodeRenderData = (
   const f32View = new Float32Array(memory.buffer, f32Ptr, f32Len);
   const textView = new Uint8Array(memory.buffer, textPtr, textLen);
 
-  // Decode UTF-8 text once
-  const textDecoder = new TextDecoder('utf-8');
-
-  // Read header
-  const versionLo = u32View[0];
-  const versionHi = u32View[1];
+  // Validate header
+  const magic = u32View[0];
+  if (magic !== MAGIC) {
+    throw new Error(`Invalid render buffer: expected magic 0x${MAGIC.toString(16)}, got 0x${magic.toString(16)}`);
+  }
+  
+  const schemaVersion = u32View[1];
+  if (schemaVersion !== SCHEMA_VERSION) {
+    throw new Error(`Incompatible schema version: expected ${SCHEMA_VERSION}, got ${schemaVersion}`);
+  }
+  
+  // Read header with offset table
+  const versionLo = u32View[2];
+  const versionHi = u32View[3];
   const version = versionLo + versionHi * 0x100000000;
-  const pageCount = u32View[2];
-  const cursorPresent = u32View[3] === 1;
-  const selectionCount = u32View[4];
-  // u32View[5] is text_buffer_len (we already know this from textLen)
+  const pageCount = u32View[4];
+  const cursorPresent = u32View[5] === 1;
+  const selectionCount = u32View[6];
+  // u32View[7] is text_buffer_len (we already know this from textLen)
+  const u32CursorOffset = u32View[8];
+  const u32SelectionOffset = u32View[9];
+  const f32CursorOffset = u32View[10];
+  const f32SelectionOffset = u32View[11];
 
-  let u32Idx = 6;
+  let u32Idx = 12; // Pages start after header
   let f32Idx = 0;
+
+  // PERFORMANCE: Decode entire text buffer once, then use substring for each line
+  // This is MUCH faster than decoding per-line (1 decode vs N decodes)
+  const fullText = textDecoder.decode(textView);
 
   const pages: PageRenderData[] = [];
 
@@ -147,22 +190,27 @@ export const decodeRenderData = (
     const lines: LineRenderData[] = [];
 
     for (let l = 0; l < lineCount; l++) {
-      const textOffset = u32View[u32Idx++];
-      const textLength = u32View[u32Idx++];
+      // Read all 10 u32 values per line (was 6, now 10)
+      u32Idx++;  // skip text_offset (byte offset, not needed for substring)
+      u32Idx++;  // skip text_length (byte length, not needed for substring)
+      const textUtf16Offset = u32View[u32Idx++];   // UTF-16 offset for substring
+      const textUtf16Len = u32View[u32Idx++];      // UTF-16 length for substring
       const blockType = u32View[u32Idx++];
       const flags = u32View[u32Idx++];
-      const markerOffset = u32View[u32Idx++];
-      const markerLen = u32View[u32Idx++];
+      u32Idx++;  // skip marker_offset (byte offset, not needed for substring)
+      u32Idx++;  // skip marker_len (byte length, not needed for substring)
+      const markerUtf16Offset = u32View[u32Idx++]; // UTF-16 offset
+      const markerUtf16Len = u32View[u32Idx++];    // UTF-16 length
 
       const x = f32View[f32Idx++];
       const y = f32View[f32Idx++];
 
-      // Decode text from buffer
-      const text = textDecoder.decode(textView.subarray(textOffset, textOffset + textLength));
+      // PERFORMANCE: Use substring instead of decode (much faster)
+      const text = fullText.substring(textUtf16Offset, textUtf16Offset + textUtf16Len);
       
-      // Decode list marker if present
-      const listMarker = markerLen > 0 
-        ? textDecoder.decode(textView.subarray(markerOffset, markerOffset + markerLen))
+      // Extract list marker using substring if present
+      const listMarker = markerUtf16Len > 0 
+        ? fullText.substring(markerUtf16Offset, markerUtf16Offset + markerUtf16Len)
         : null;
 
       const isHeading = (flags & FLAG_IS_HEADING) !== 0;
@@ -189,28 +237,37 @@ export const decodeRenderData = (
     });
   }
 
-  // Decode cursor
+  // Decode cursor using offset table (random access for both u32 and f32)
   let cursor: CursorRenderData | null = null;
-  if (cursorPresent) {
-    cursor = {
-      x: f32View[f32Idx++],
-      y: f32View[f32Idx++],
-      height: f32View[f32Idx++],
-      pageIndex: Math.floor(f32View[f32Idx++]),
-      lineCharOffset: Math.floor(f32View[f32Idx++]),
-    };
+  if (cursorPresent && u32CursorOffset > 0 && f32CursorOffset > 0) {
+    // u32: indices at u32CursorOffset
+    const pageIndex = u32View[u32CursorOffset];
+    const utf16OffsetInLine = u32View[u32CursorOffset + 1];
+    
+    // f32: geometry at f32CursorOffset (random access, not sequential)
+    const x = f32View[f32CursorOffset];
+    const y = f32View[f32CursorOffset + 1];
+    const height = f32View[f32CursorOffset + 2];
+    
+    cursor = { x, y, height, pageIndex, utf16OffsetInLine };
   }
 
-  // Decode selections
+  // Decode selections using offset table (random access for both u32 and f32)
   const selections: SelectionRenderData[] = [];
-  for (let s = 0; s < selectionCount; s++) {
-    selections.push({
-      x: f32View[f32Idx++],
-      y: f32View[f32Idx++],
-      width: f32View[f32Idx++],
-      height: f32View[f32Idx++],
-      pageIndex: Math.floor(f32View[f32Idx++]),
-    });
+  if (selectionCount > 0 && u32SelectionOffset > 0 && f32SelectionOffset > 0) {
+    for (let s = 0; s < selectionCount; s++) {
+      // u32: index at u32SelectionOffset
+      const pageIndex = u32View[u32SelectionOffset + s];
+      
+      // f32: geometry at f32SelectionOffset (random access, not sequential)
+      const f32Base = f32SelectionOffset + s * 4; // Each selection has 4 f32 values
+      const x = f32View[f32Base];
+      const y = f32View[f32Base + 1];
+      const width = f32View[f32Base + 2];
+      const height = f32View[f32Base + 3];
+      
+      selections.push({ x, y, width, height, pageIndex });
+    }
   }
 
   return {
@@ -281,7 +338,7 @@ export interface WasmEditorInterface {
   getContentHeight(): number;
 
   // Cursor info
-  getCursorParaId(): number;
+  getCursorParaId(): bigint;
   getCursorOffset(): number;
   hasSelection(): boolean;
 }

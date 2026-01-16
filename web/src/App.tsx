@@ -62,7 +62,7 @@ function App() {
         const memory = wasm.getWasmMemory() as WebAssembly.Memory;
         setWasmMemory(memory);
 
-        const ed = new wasm.WasmEditor() as WasmEditorInterface;
+        const ed = new wasm.WasmEditor() as unknown as WasmEditorInterface;
         setEditor(ed);
         setConstraints(getLayoutConstraints(ed));
         updateRenderData(ed, memory);
@@ -71,6 +71,7 @@ function App() {
       }
     };
     loadWasm();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const updateRenderData = useCallback((ed: WasmEditorInterface, memory: WebAssembly.Memory) => {
@@ -286,7 +287,7 @@ function Page({
     }
     
     // Measure the text up to the cursor position using unscaled font (same as render)
-    const textBeforeCursor = cursorLine.text.slice(0, cursor.lineCharOffset);
+    const textBeforeCursor = cursorLine.text.slice(0, cursor.utf16OffsetInLine);
     // Use unscaled font for measurement, since we measure in document coords
     const font = getFontForLine(cursorLine, 1); // Use scale=1 for document-space measurement
     const measuredWidth = measureTextWidth(textBeforeCursor, font);
@@ -294,7 +295,7 @@ function Page({
     console.log('[Cursor]', {
       lineText: `"${cursorLine.text}"`,
       lineTextLen: cursorLine.text.length,
-      lineCharOffset: cursor.lineCharOffset,
+      utf16OffsetInLine: cursor.utf16OffsetInLine,
       textBeforeCursor: `"${textBeforeCursor}"`,
       font,
       measuredWidth,

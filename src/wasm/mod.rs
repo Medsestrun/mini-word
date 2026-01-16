@@ -7,7 +7,16 @@ pub mod flat_buffer;
 use wasm_bindgen::prelude::*;
 use crate::document::BlockKind;
 use crate::{Editor, LayoutConstraints, Rect};
-use flat_buffer::{RenderBuffer, block_kind_to_opcode};
+use flat_buffer::{
+    RenderBuffer, 
+    block_kind_to_opcode,
+    HEADER_SIZE,
+    U32_PER_LINE,
+    U32_PER_CURSOR,
+    U32_PER_SELECTION,
+    F32_PER_CURSOR,
+    F32_PER_SELECTION,
+};
 
 /// Get access to WASM memory for zero-copy data access
 #[wasm_bindgen(js_name = getWasmMemory)]
@@ -179,7 +188,43 @@ impl WasmEditor {
         let display_list = self.editor.build_display_list(viewport);
         let constraints = self.editor.layout.constraints();
 
-        self.render_buffer.clear();
+        // Pre-calculate buffer sizes to avoid reallocation (critical: JS holds pointers to these buffers)
+        let mut total_lines = 0;
+        let mut total_text_bytes = 0;
+        let mut cursor_count = 0;
+        let mut selection_count = 0;
+
+        for page in &display_list.pages {
+            for item in &page.items {
+                match item {
+                    crate::render::DisplayItem::TextRun { text, block_kind, .. } => {
+                        total_lines += 1;
+                        total_text_bytes += text.len();
+                        
+                        // Add marker length if present
+                        if let BlockKind::ListItem { marker, .. } = block_kind {
+                            total_text_bytes += marker.display().len();
+                        }
+                    }
+                    crate::render::DisplayItem::Caret { .. } => {
+                        cursor_count = 1;
+                    }
+                    crate::render::DisplayItem::SelectionRect { .. } => {
+                        selection_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Estimate buffer sizes
+        let page_count = display_list.pages.len();
+        let u32_needed = HEADER_SIZE + page_count * 2 + total_lines * U32_PER_LINE + cursor_count * U32_PER_CURSOR + selection_count * U32_PER_SELECTION;
+        let f32_needed = page_count * 3 + total_lines * 2 + cursor_count * F32_PER_CURSOR + selection_count * F32_PER_SELECTION;
+        let text_needed = total_text_bytes;
+
+        // Pre-allocate buffers to avoid reallocation during rendering
+        self.render_buffer.prepare(u32_needed, f32_needed, text_needed);
 
         // Write header
         self.render_buffer.write_header(
@@ -188,8 +233,7 @@ impl WasmEditor {
         );
 
         // Collect cursor and selections separately - they must be written AFTER all pages/lines
-        // to maintain the expected f32 buffer layout
-        // cursor_data: (x, y, height, page_index, line_char_offset)
+        // cursor_data: (x, y, height, page_index, utf16_offset_in_line)
         let mut cursor_data: Option<(f32, f32, f32, usize, usize)> = None;
         let mut selections: Vec<(f32, f32, f32, f32, usize)> = Vec::new();
 
@@ -226,9 +270,9 @@ impl WasmEditor {
                         );
                         line_count += 1;
                     }
-                    crate::render::DisplayItem::Caret { position, height, line_char_offset } => {
+                    crate::render::DisplayItem::Caret { position, height, utf16_offset_in_line } => {
                         // Collect cursor data to write after all pages
-                        cursor_data = Some((position.x, position.y, *height, page.page_index, *line_char_offset));
+                        cursor_data = Some((position.x, position.y, *height, page.page_index, *utf16_offset_in_line));
                     }
                     crate::render::DisplayItem::SelectionRect { rect } => {
                         // Collect selection data to write after all pages
@@ -242,51 +286,54 @@ impl WasmEditor {
         }
 
         // Second pass: write cursor and selections after all pages/lines
-        if let Some((x, y, height, page_index, line_char_offset)) = cursor_data {
-            self.render_buffer.write_cursor(x, y, height, page_index, line_char_offset);
+        if let Some((x, y, height, page_index, utf16_offset)) = cursor_data {
+            self.render_buffer.write_cursor(x, y, height, page_index, utf16_offset);
         }
 
         for (x, y, width, height, page_index) in &selections {
             self.render_buffer.write_selection(*x, *y, *width, *height, *page_index);
         }
 
-        self.render_buffer.set_selection_count(selections.len() as u32);
+        // Selection count is automatically tracked and written in finalize()
         self.render_buffer.finalize();
     }
 
     /// Get pointer to u32 buffer (call buildRenderData first)
+    /// Returns u32 offset in WASM linear memory
     #[wasm_bindgen(js_name = getU32Ptr)]
-    pub fn get_u32_ptr(&self) -> *const u32 {
+    pub fn get_u32_ptr(&self) -> u32 {
         self.render_buffer.u32_ptr()
     }
 
     /// Get length of u32 buffer
     #[wasm_bindgen(js_name = getU32Len)]
-    pub fn get_u32_len(&self) -> usize {
+    pub fn get_u32_len(&self) -> u32 {
         self.render_buffer.u32_len()
     }
 
     /// Get pointer to f32 buffer
+    /// Returns u32 offset in WASM linear memory
     #[wasm_bindgen(js_name = getF32Ptr)]
-    pub fn get_f32_ptr(&self) -> *const f32 {
+    pub fn get_f32_ptr(&self) -> u32 {
         self.render_buffer.f32_ptr()
     }
 
     /// Get length of f32 buffer
     #[wasm_bindgen(js_name = getF32Len)]
-    pub fn get_f32_len(&self) -> usize {
+    pub fn get_f32_len(&self) -> u32 {
         self.render_buffer.f32_len()
     }
 
     /// Get pointer to text buffer
+    /// Returns u32 offset in WASM linear memory
     #[wasm_bindgen(js_name = getTextPtr)]
-    pub fn get_text_ptr(&self) -> *const u8 {
+    pub fn get_text_ptr(&self) -> u32 {
         self.render_buffer.text_ptr()
     }
 
     /// Get length of text buffer
     #[wasm_bindgen(js_name = getTextLen)]
-    pub fn get_text_len(&self) -> usize {
+    pub fn get_text_len(&self) -> u32 {
         self.render_buffer.text_len()
     }
 

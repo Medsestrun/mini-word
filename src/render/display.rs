@@ -61,8 +61,8 @@ pub enum DisplayItem {
     Caret {
         position: Point,
         height: f32,
-        /// Character offset within the line (for frontend text measurement)
-        line_char_offset: usize,
+        /// UTF-16 code unit offset within the line (for correct JS text measurement)
+        utf16_offset_in_line: usize,
     },
     /// Selection highlight
     SelectionRect {
@@ -232,7 +232,7 @@ impl DisplayList {
             }
 
             // Cursor
-            if let Some((caret_pos, line_char_offset)) = Self::cursor_position(
+            if let Some((caret_pos, utf16_offset)) = Self::cursor_position(
                 document,
                 layout,
                 cursor,
@@ -242,7 +242,7 @@ impl DisplayList {
                 items.push(DisplayItem::Caret {
                     position: caret_pos,
                     height: crate::layout::LINE_HEIGHT,
-                    line_char_offset,
+                    utf16_offset_in_line: utf16_offset,
                 });
             }
 
@@ -265,7 +265,8 @@ impl DisplayList {
     }
 
     /// Calculate cursor position on page
-    /// Returns (Point, line_char_offset) where line_char_offset is the character position within the line
+    /// Returns (Point, utf16_offset) where utf16_offset is the UTF-16 code unit offset within the line
+    /// (UTF-16 offsets are used for correct text measurement in JavaScript)
     fn cursor_position(
         document: &Document,
         layout: &LayoutState,
@@ -291,8 +292,19 @@ impl DisplayList {
             return None;
         }
 
-        // Calculate character offset within line
-        let line_char_offset = cursor.position.offset.saturating_sub(line.byte_range.start);
+        // Calculate UTF-16 code unit offset within line
+        // Get paragraph text and extract the portion from line start to cursor
+        let para_text = document.paragraph_text(cursor.position.para_id);
+        let line_start_byte = line.byte_range.start;
+        let cursor_byte = cursor.position.offset;
+        
+        // Get text from line start to cursor position (both are byte offsets within paragraph)
+        let text_before_cursor = para_text
+            .get(line_start_byte..cursor_byte)
+            .unwrap_or("");
+        
+        // Convert to UTF-16 code units for JS
+        let utf16_offset = text_before_cursor.chars().map(|c| c.len_utf16()).sum::<usize>();
 
         // Calculate Y position
         let mut y = constraints.margin_top;
@@ -335,7 +347,7 @@ impl DisplayList {
                         let x = constraints.margin_left + indent + 
                             line.x_for_offset(cursor.position.offset);
                         
-                        return Some((Point { x, y }, line_char_offset));
+                        return Some((Point { x, y }, utf16_offset));
                     }
 
                     y += ln.height;

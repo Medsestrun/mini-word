@@ -258,7 +258,7 @@ impl DiffEngine {
 
         // Handle cursor and selection separately
         let prev_caret = prev_page.items.iter().find_map(|item| {
-            if let DisplayItem::Caret { position, height: _, line_char_offset: _ } = item {
+            if let DisplayItem::Caret { position, height: _, utf16_offset_in_line: _ } = item {
                 Some(*position)
             } else {
                 None
@@ -266,7 +266,7 @@ impl DiffEngine {
         });
 
         let curr_caret = curr_page.items.iter().find_map(|item| {
-            if let DisplayItem::Caret { position, height: _, line_char_offset: _ } = item {
+            if let DisplayItem::Caret { position, height: _, utf16_offset_in_line: _ } = item {
                 Some(*position)
             } else {
                 None
