@@ -50,6 +50,10 @@ pub enum DisplayItem {
         position: Point,
         text: String,
         block_kind: BlockKind,
+        /// UTF-16 code unit range (start, end) relative to line text
+        selection_range: Option<(usize, usize)>,
+        /// Style spans (start, len, font_id) relative to line text (in bytes)
+        styles: Vec<(usize, usize, u32)>,
     },
     /// List marker (bullet or number)
     ListMarker {
@@ -63,10 +67,6 @@ pub enum DisplayItem {
         height: f32,
         /// UTF-16 code unit offset within the line (for correct JS text measurement)
         utf16_offset_in_line: usize,
-    },
-    /// Selection highlight
-    SelectionRect {
-        rect: Rect,
     },
     /// Page break indicator
     PageBreak {
@@ -151,6 +151,7 @@ impl DisplayList {
                             kind: BlockKind::Paragraph,
                             start_offset: 0,
                             byte_len: 0,
+                            styles: Vec::new(),
                         })
                     );
 
@@ -192,6 +193,47 @@ impl DisplayList {
                             String::new()
                         };
 
+                        // Selection range for this line
+                        let selection_range = selection.and_then(|sel| {
+                            if !sel.is_collapsed() {
+                                Self::selection_range_for_line(
+                                    document,
+                                    para_id,
+                                    line,
+                                    sel,
+                                    &line_text,
+                                )
+                            } else {
+                                None
+                            }
+                        });
+
+                        // Calculate styles for this line
+                        // Line byte range is relative to paragraph start
+                        // Styles in block_meta are relative to paragraph start
+                        // We need to output styles relative to line start
+                        let line_styles = if let Some(meta) = block_meta {
+                            meta.styles.iter()
+                                .filter_map(|s| {
+                                    // Intersect [s.start, s.end) with [line.byte_range.start, line.byte_range.end)
+                                    let start = s.start.max(line.byte_range.start);
+                                    let end = s.end.min(line.byte_range.end);
+                                    
+                                    if start < end {
+                                        Some((
+                                            start - line.byte_range.start,
+                                            end - start,
+                                            s.font_id.0
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+
                         // Text run
                         items.push(DisplayItem::TextRun {
                             id: DisplayItemId::new(para_id, line_idx, 0),
@@ -201,26 +243,9 @@ impl DisplayList {
                             },
                             text: line_text,
                             block_kind: block_kind.clone(),
+                            selection_range,
+                            styles: line_styles,
                         });
-
-                        // Selection rectangles
-                        if let Some(sel) = selection {
-                            if !sel.is_collapsed() {
-                                if let Some(rect) = Self::selection_rect_for_line(
-                                    document,
-                                    layout,
-                                    para_id,
-                                    line_idx,
-                                    line,
-                                    sel,
-                                    constraints,
-                                    y,
-                                    indent,
-                                ) {
-                                    items.push(DisplayItem::SelectionRect { rect });
-                                }
-                            }
-                        }
 
                         y += line.height;
                     }
@@ -241,7 +266,7 @@ impl DisplayList {
             ) {
                 items.push(DisplayItem::Caret {
                     position: caret_pos,
-                    height: crate::layout::LINE_HEIGHT,
+                    height: layout.font_library.get(crate::layout::font::FontId(0)).map(|m| m.line_height).unwrap_or(16.0),
                     utf16_offset_in_line: utf16_offset,
                 });
             }
@@ -335,17 +360,10 @@ impl DisplayList {
 
                     if para_id == cursor.position.para_id && idx == line_idx {
                         // Found cursor line
-                        let block_meta = document.block_meta(para_id);
-                        let indent = layout.indent_for(
-                            block_meta.unwrap_or(&crate::document::BlockMeta {
-                                kind: BlockKind::Paragraph,
-                                start_offset: 0,
-                                byte_len: 0,
-                            })
-                        );
-
-                        let x = constraints.margin_left + indent + 
-                            line.x_for_offset(cursor.position.offset);
+                        // Note: We don't calculate precise X here because Web client
+                        // calculates it using DOM measurement for perfect alignment.
+                        // We still provide Y and utf16_offset which are essential.
+                        let x = 0.0;
                         
                         return Some((Point { x, y }, utf16_offset));
                     }
@@ -362,57 +380,69 @@ impl DisplayList {
         None
     }
 
-    /// Calculate selection rectangle for a line
-    fn selection_rect_for_line(
-        document: &Document,
-        layout: &LayoutState,
+    /// Calculate selection range (UTF-16) for a line
+    fn selection_range_for_line(
+        _document: &Document,
         para_id: ParagraphId,
-        line_idx: usize,
         line: &crate::layout::LineLayout,
         selection: &Selection,
-        constraints: &crate::layout::LayoutConstraints,
-        y: f32,
-        indent: f32,
-    ) -> Option<Rect> {
+        line_text: &str, // slice of text for this line
+    ) -> Option<(usize, usize)> {
         let (sel_start, sel_end) = selection.ordered();
         
-        // Convert selection to absolute offsets
-        let sel_start_abs = document.position_to_offset(&sel_start);
-        let sel_end_abs = document.position_to_offset(&sel_end);
-
-        // Get paragraph start offset
-        let para_start = document.block_meta(para_id)?.start_offset;
+        // Convert selection to absolute byte offsets
+        // Note: selection positions (DocPosition) are relative to paragraph start
+        // But for comparison, we need to handle paragraph boundaries.
+        // Actually, we can just compare DocPosition directly if we are careful.
+        // But line ranges are byte offsets within paragraph.
         
-        // Convert line range to absolute
-        let line_start_abs = para_start + line.byte_range.start;
-        let line_end_abs = para_start + line.byte_range.end;
-
-        // Check if line intersects selection
-        if line_end_abs <= sel_start_abs.0 || line_start_abs >= sel_end_abs.0 {
+        // Check if this paragraph intersects selection
+        if para_id < sel_start.para_id || para_id > sel_end.para_id {
             return None;
         }
 
-        // Calculate X coordinates
-        let start_x = if sel_start_abs.0 <= line_start_abs {
-            0.0
+        // Line byte range in paragraph
+        let line_start_byte = line.byte_range.start;
+        let line_end_byte = line.byte_range.end;
+
+        // Calculate intersection in paragraph-relative byte offsets
+        let intersect_start_byte = if para_id == sel_start.para_id {
+            sel_start.offset.max(line_start_byte)
         } else {
-            let offset_in_line = sel_start_abs.0 - para_start - line.byte_range.start;
-            line.x_for_offset(line.byte_range.start + offset_in_line)
+            line_start_byte
         };
 
-        let end_x = if sel_end_abs.0 >= line_end_abs {
-            line.width
+        let intersect_end_byte = if para_id == sel_end.para_id {
+            sel_end.offset.min(line_end_byte)
         } else {
-            let offset_in_line = sel_end_abs.0 - para_start - line.byte_range.start;
-            line.x_for_offset(line.byte_range.start + offset_in_line)
+            line_end_byte
         };
 
-        Some(Rect {
-            x: constraints.margin_left + indent + start_x,
-            y,
-            width: end_x - start_x,
-            height: line.height,
-        })
+        if intersect_start_byte >= intersect_end_byte {
+            return None;
+        }
+
+        // Now we have the byte range *within the paragraph* that is selected: [intersect_start_byte, intersect_end_byte)
+        // We need to convert this to UTF-16 offsets *relative to the line start*.
+        
+        // Offset relative to line start (bytes)
+        let rel_start_byte = intersect_start_byte.saturating_sub(line_start_byte);
+        let rel_end_byte = intersect_end_byte.saturating_sub(line_start_byte);
+        
+        // Safety check for slicing
+        if rel_start_byte > line_text.len() || rel_end_byte > line_text.len() {
+            return None; 
+        }
+
+        // Convert byte offsets to UTF-16 offsets
+        let text_before_start = &line_text[..rel_start_byte];
+        let text_segment = &line_text[rel_start_byte..rel_end_byte];
+        
+        let utf16_start = text_before_start.chars().map(|c| c.len_utf16()).sum::<usize>();
+        let utf16_len = text_segment.chars().map(|c| c.len_utf16()).sum::<usize>();
+        let utf16_end = utf16_start + utf16_len;
+
+        Some((utf16_start, utf16_end))
     }
 }
 

@@ -69,8 +69,13 @@ pub const FLAG_IS_LIST_ITEM: u32 = 0b0010;
 
 /// Number of u32 values per line in the buffer
 /// [text_offset, text_len, text_utf16_offset, text_utf16_len, 
-///  block_type, flags, marker_offset, marker_len, marker_utf16_offset, marker_utf16_len]
-pub const U32_PER_LINE: usize = 10;
+///  block_type, flags, marker_offset, marker_len, marker_utf16_offset, marker_utf16_len,
+///  sel_start, sel_end, style_start_idx, style_count]
+pub const U32_PER_LINE: usize = 14;
+
+/// Number of u32 values per style span
+/// [start, len, font_id]
+pub const U32_PER_STYLE: usize = 3;
 
 /// Number of u32 values for cursor indices
 pub const U32_PER_CURSOR: usize = 2; // page_index, utf16_offset_in_line
@@ -110,6 +115,8 @@ pub struct RenderBuffer {
     pub f32_data: Vec<f32>,
     /// UTF-8 text buffer
     pub text_data: Vec<u8>,
+    /// Style data buffer (flat list of style spans)
+    pub style_data: Vec<u32>,
     
     // Pending cursor/selections (written in finalize() to guarantee correct offsets)
     pending_cursor: Option<PendingCursor>,
@@ -131,6 +138,7 @@ impl RenderBuffer {
             u32_data: Vec::with_capacity(1024),
             f32_data: Vec::with_capacity(1024),
             text_data: Vec::with_capacity(4096),
+            style_data: Vec::with_capacity(512),
             pending_cursor: None,
             pending_selections: Vec::new(),
             utf16_text_offset: 0,
@@ -141,6 +149,7 @@ impl RenderBuffer {
         self.u32_data.clear();
         self.f32_data.clear();
         self.text_data.clear();
+        self.style_data.clear();
         self.pending_cursor = None;
         self.pending_selections.clear();
         self.utf16_text_offset = 0;
@@ -177,6 +186,15 @@ impl RenderBuffer {
             self.text_data = Vec::with_capacity(text_target);
         } else {
             self.text_data.clear();
+        }
+
+        // Reserve space for style data (simplistic for now)
+        // Assume 1 style per line on average if not specified? 
+        // We really should pass style_needed but let's just ensure some capacity.
+        if self.style_data.capacity() < u32_target { // Rough heuristic or fix later
+             self.style_data = Vec::with_capacity(u32_target);
+        } else {
+             self.style_data.clear();
         }
         
         // Clear pending data
@@ -338,6 +356,8 @@ impl RenderBuffer {
         block_type: u32,
         flags: u32,
         list_marker: Option<&str>,
+        selection_range: Option<(usize, usize)>,
+        styles: &[(usize, usize, u32)], // (start, len, font_id)
     ) {
         // Write text to buffer and record offset
         let text_offset = self.text_data.len() as u32;
@@ -377,8 +397,24 @@ impl RenderBuffer {
             marker_offset, marker_len
         );
 
+        // Parse selection range or use MAX for none
+        let (sel_start, sel_end) = selection_range
+            .map(|(s, e)| (s as u32, e as u32))
+            .unwrap_or((u32::MAX, u32::MAX));
+            
+        // Write styles
+        let style_start_idx = self.style_data.len() as u32;
+        let style_count = styles.len() as u32;
+        
+        for &(start, len, font_id) in styles {
+            self.style_data.push(start as u32);
+            self.style_data.push(len as u32);
+            self.style_data.push(font_id);
+        }
+
         // u32: text_offset, text_len, text_utf16_offset, text_utf16_len,
-        //      block_type, flags, marker_offset, marker_len, marker_utf16_offset, marker_utf16_len
+        //      block_type, flags, marker_offset, marker_len, marker_utf16_offset, marker_utf16_len,
+        //      sel_start, sel_end, style_start_idx, style_count
         self.u32_data.push(text_offset);
         self.u32_data.push(text_len);
         self.u32_data.push(text_utf16_offset);
@@ -389,6 +425,10 @@ impl RenderBuffer {
         self.u32_data.push(marker_len);
         self.u32_data.push(marker_utf16_offset);
         self.u32_data.push(marker_utf16_len);
+        self.u32_data.push(sel_start);
+        self.u32_data.push(sel_end);
+        self.u32_data.push(style_start_idx);
+        self.u32_data.push(style_count);
 
         // f32: x, y
         self.f32_data.push(x);
@@ -445,6 +485,14 @@ impl RenderBuffer {
     pub fn text_len(&self) -> u32 {
         self.text_data.len() as u32
     }
+
+    pub fn style_ptr(&self) -> u32 {
+        self.style_data.as_ptr() as u32
+    }
+
+    pub fn style_len(&self) -> u32 {
+        self.style_data.len() as u32
+    }
 }
 
 /// Convert BlockKind to block type opcode
@@ -479,7 +527,7 @@ mod tests {
         buf.write_header(42, 1);
         
         let line_idx = buf.begin_page(0, 0.0, 816.0, 1056.0);
-        buf.write_line(96.0, 96.0, "Hello", BLOCK_PARAGRAPH, 0, None);
+        buf.write_line(96.0, 96.0, "Hello", BLOCK_PARAGRAPH, 0, None, None, &[]);
         buf.set_line_count(line_idx, 1);
         buf.finalize();
 
@@ -578,7 +626,7 @@ mod tests {
             let line_idx = buf.begin_page(p, 0.0, 816.0, 1056.0);
             
             for _ in 0..50 {
-                buf.write_line(96.0, 96.0, "Hello, World! This is a test line with some text.", BLOCK_PARAGRAPH, 0, None);
+                buf.write_line(96.0, 96.0, "Hello, World! This is a test line with some text.", BLOCK_PARAGRAPH, 0, None, None, &[]);
             }
             
             buf.set_line_count(line_idx, 50);
@@ -650,12 +698,12 @@ mod tests {
         
         // Now write pages AFTER cursor/selection
         let line_idx = buf.begin_page(0, 0.0, 816.0, 1056.0);
-        buf.write_line(96.0, 96.0, "First page line 1", BLOCK_PARAGRAPH, 0, None);
-        buf.write_line(96.0, 120.0, "First page line 2", BLOCK_PARAGRAPH, 0, None);
+        buf.write_line(96.0, 96.0, "First page line 1", BLOCK_PARAGRAPH, 0, None, None, &[]);
+        buf.write_line(96.0, 120.0, "First page line 2", BLOCK_PARAGRAPH, 0, None, None, &[]);
         buf.set_line_count(line_idx, 2);
         
         let line_idx = buf.begin_page(1, 1056.0, 816.0, 1056.0);
-        buf.write_line(96.0, 1152.0, "Second page line 1", BLOCK_PARAGRAPH, 0, None);
+        buf.write_line(96.0, 1152.0, "Second page line 1", BLOCK_PARAGRAPH, 0, None, None, &[]);
         buf.set_line_count(line_idx, 1);
         
         buf.finalize();
@@ -690,13 +738,13 @@ mod tests {
         // Write pages with multiple lines (each line adds 2 f32 values)
         let line_idx = buf.begin_page(0, 0.0, 816.0, 1056.0);
         for _ in 0..5 {
-            buf.write_line(96.0, 100.0, "Line with text", BLOCK_PARAGRAPH, 0, None);
+            buf.write_line(96.0, 100.0, "Line with text", BLOCK_PARAGRAPH, 0, None, None, &[]);
         }
         buf.set_line_count(line_idx, 5);
         
         let line_idx = buf.begin_page(1, 1056.0, 816.0, 1056.0);
         for _ in 0..3 {
-            buf.write_line(96.0, 1100.0, "Another line", BLOCK_PARAGRAPH, 0, None);
+            buf.write_line(96.0, 1100.0, "Another line", BLOCK_PARAGRAPH, 0, None, None, &[]);
         }
         buf.set_line_count(line_idx, 3);
         
@@ -742,15 +790,15 @@ mod tests {
         let line_count_idx = buf.begin_page(0, 0.0, 800.0, 1200.0);
         
         // Line 1: ASCII text (1 byte = 1 UTF-16 code unit)
-        buf.write_line(0.0, 0.0, "Hello World", 0, 0, None);
+        buf.write_line(0.0, 0.0, "Hello World", 0, 0, None, None, &[]);
         
         // Line 2: Text with emoji (4 bytes = 2 UTF-16 code units)
         // "Test 😀 emoji" = "Test " (5) + 😀 (2 UTF-16) + " emoji" (6) = 13 UTF-16 units
-        buf.write_line(0.0, 20.0, "Test 😀 emoji", 0, 0, None);
+        buf.write_line(0.0, 20.0, "Test 😀 emoji", 0, 0, None, None, &[]);
         
         // Line 3: Text with Cyrillic (2 bytes = 1 UTF-16 code unit)
         // "Привет мир" = 10 chars, each 1 UTF-16 unit = 10 UTF-16 units
-        buf.write_line(0.0, 40.0, "Привет мир", 0, 0, None);
+        buf.write_line(0.0, 40.0, "Привет мир", 0, 0, None, None, &[]);
         
         buf.set_line_count(line_count_idx, 3);
         buf.finalize();

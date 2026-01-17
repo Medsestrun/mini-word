@@ -316,10 +316,16 @@ impl Rope {
         let height = self.root.height();
         let optimal_height = (self.len() as f64 / MAX_LEAF_SIZE as f64).log2().ceil() as usize + 1;
 
-        // Rebalance if tree is too unbalanced
+        // Rebalance if tree is too unbalanced (2x optimal height is a reasonable heuristic)
         if height > optimal_height * 2 {
-            let text = self.to_string();
-            *self = Self::from_str(&text);
+            // Collect all leaves
+            let mut leaves = Vec::new();
+            // Take the root to consume it
+            let root = std::mem::take(&mut self.root);
+            root.collect_leaves(&mut leaves);
+            
+            // Rebuild balanced tree
+            self.root = Self::build_tree(leaves);
         }
     }
 }
@@ -355,6 +361,17 @@ impl RopeNode {
         match self {
             RopeNode::Empty | RopeNode::Leaf { .. } => 1,
             RopeNode::Branch { left, right, .. } => 1 + left.height().max(right.height()),
+        }
+    }
+
+    fn collect_leaves(self, leaves: &mut Vec<RopeNode>) {
+        match self {
+            RopeNode::Empty => {}
+            RopeNode::Leaf { .. } => leaves.push(self),
+            RopeNode::Branch { left, right, .. } => {
+                left.collect_leaves(leaves);
+                right.collect_leaves(leaves);
+            }
         }
     }
 

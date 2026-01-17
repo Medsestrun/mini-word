@@ -3,7 +3,7 @@
 use crate::document::ParagraphId;
 
 /// Position in document as (paragraph_id, offset_within_paragraph)
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DocPosition {
     /// The paragraph containing this position
     pub para_id: ParagraphId,

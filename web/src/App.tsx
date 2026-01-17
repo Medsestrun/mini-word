@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState, useCallback, useLayoutEffect } from 'react';
+import { fontService } from './fontService';
 import './App.css';
 import {
   type RenderData,
   type PageRenderData,
   type LineRenderData,
   type CursorRenderData,
-  type SelectionRenderData,
   type LayoutConstraints,
   type WasmEditorInterface,
   getRenderDataFromEditor,
@@ -22,9 +22,17 @@ function App() {
   const [constraints, setConstraints] = useState<LayoutConstraints | null>(null);
   const [cursorVisible, setCursorVisible] = useState(true);
   const [isComposing, setIsComposing] = useState(false);
+  const [fontFamily, setFontFamily] = useState('Menlo');
+  const [fontSize, setFontSize] = useState(14);
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   const inputLayerRef = useRef<HTMLDivElement>(null);
+
+
+  const updateRenderData = useCallback((ed: WasmEditorInterface, memory: WebAssembly.Memory) => {
+    const data = getRenderDataFromEditor(ed, memory, 0, 10000);
+    setRenderData(data);
+  }, []);
 
   // Load WASM module
   useEffect(() => {
@@ -32,7 +40,7 @@ function App() {
       try {
         const wasm = await import('../../pkg/mini_word.js');
         await wasm.default();
-        
+
         // Get WASM memory for zero-copy access
         const memory = wasm.getWasmMemory() as WebAssembly.Memory;
         setWasmMemory(memory);
@@ -49,10 +57,40 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const updateRenderData = useCallback((ed: WasmEditorInterface, memory: WebAssembly.Memory) => {
-    const data = getRenderDataFromEditor(ed, memory, 0, 10000);
-    setRenderData(data);
-  }, []);
+  const updateFontMetrics = useCallback(() => {
+    if (!editor) return;
+    const { id, metrics, isNew } = fontService.getOrRegisterFont(fontFamily, fontSize);
+    console.log('[App] updateFontMetrics', { id, fontFamily, fontSize, isNew, metrics });
+
+    if (isNew) {
+      editor.addFont(id, metrics.lineHeight, metrics.charWidths, metrics.defaultWidth);
+    }
+
+    const hasSelection = editor.hasSelection();
+    console.log('[App] hasSelection:', hasSelection);
+
+    // If we have a selection, format it
+    if (hasSelection) {
+      console.log('[App] Formatting selection with font', id);
+      editor.formatSelection(id);
+    } else {
+      console.log('[App] No selection, updating global defaults');
+      editor.setFontMetrics(metrics.lineHeight, metrics.charWidths, metrics.defaultWidth);
+    }
+
+  }, [editor, fontFamily, fontSize]);
+
+  // Update fonts when changed or editor ready
+  useEffect(() => {
+    if (editor && wasmMemory) {
+      updateFontMetrics();
+      updateRenderData(editor, wasmMemory);
+      // Restore focus to editor so user can keep typing
+      inputLayerRef.current?.focus();
+    }
+  }, [editor, wasmMemory, updateFontMetrics, updateRenderData]);
+
+
 
   // Cursor blink
   useEffect(() => {
@@ -121,7 +159,7 @@ function App() {
       if (handled) {
         setCursorVisible(true);
         updateRenderData(editor, wasmMemory);
-        
+
         // Clear the contenteditable content to prevent DOM mutation
         inputElement.textContent = '';
       }
@@ -162,7 +200,7 @@ function App() {
         e.preventDefault();
         editor.selectAll();
         handled = true;
-      } 
+      }
       // Navigation keys
       else if (e.key === 'ArrowLeft') {
         e.preventDefault();
@@ -208,7 +246,7 @@ function App() {
   //       editor.insertText(text);
   //       setCursorVisible(true);
   //       updateRenderData(editor, wasmMemory);
-        
+
   //       // Clear the contenteditable content
   //       target.textContent = '';
   //     }
@@ -238,7 +276,7 @@ function App() {
         editor.insertText(e.data);
         setCursorVisible(true);
         updateRenderData(editor, wasmMemory);
-        
+
         // Clear the contenteditable content
         if (inputLayerRef.current) {
           inputLayerRef.current.textContent = '';
@@ -252,7 +290,7 @@ function App() {
   const handlePaste = useCallback(
     (e: React.ClipboardEvent) => {
       e.preventDefault();
-      
+
       if (!editor || !wasmMemory) return;
 
       const text = e.clipboardData.getData('text/plain');
@@ -303,12 +341,9 @@ function App() {
   // Handle mouse selection
   const [isMouseDown, setIsMouseDown] = useState(false);
 
-  const getDocumentPositionFromMouse = useCallback((clientX: number, clientY: number): {paraIndex: number, offset: number} | null => {
+  const getDocumentPositionFromMouse = useCallback((clientX: number, clientY: number): { pageIndex: number, x: number, y: number } | null => {
     if (!renderData || !constraints) return null;
 
-    // Convert screen coordinates to document coordinates
-    // This is a simplified version - production would need more precise calculation
-    
     // Find which page was clicked
     for (const page of renderData.pages) {
       const pageElement = document.querySelector(`[data-page-index="${page.pageIndex}"]`) as HTMLElement;
@@ -316,32 +351,14 @@ function App() {
 
       const rect = pageElement.getBoundingClientRect();
       if (clientY >= rect.top && clientY <= rect.bottom) {
-        // Found the page, now find the line
-        const docY = (clientY - rect.top) / SCALE;
-        const docX = (clientX - rect.left) / SCALE;
+        // Calculate coordinates relative to page (unscaled)
+        const x = (clientX - rect.left) / SCALE;
+        const y = (clientY - rect.top) / SCALE;
 
-        for (let i = 0; i < page.lines.length; i++) {
-          const line = page.lines[i];
-          const lineHeight = 14 * 1.2; // font-size * line-height
-          
-          if (docY >= line.y && docY <= line.y + lineHeight) {
-            // Found the line, estimate character offset
-            // This is simplified - production would use Range API or more precise measurement
-            const charWidth = 8; // Rough estimate
-            const offset = Math.round((docX - line.x) / charWidth);
-            const clampedOffset = Math.max(0, Math.min(offset, line.text.length));
-            
-            return {
-              paraIndex: i, // Simplified - would need actual paragraph ID
-              offset: clampedOffset
-            };
-          }
-        }
-        
-        // Clicked below last line
         return {
-          paraIndex: page.lines.length - 1,
-          offset: page.lines[page.lines.length - 1]?.text.length || 0
+          pageIndex: page.pageIndex,
+          x,
+          y
         };
       }
     }
@@ -351,33 +368,27 @@ function App() {
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (!editor || !wasmMemory) return;
-    
+
     setIsMouseDown(true);
     const pos = getDocumentPositionFromMouse(e.clientX, e.clientY);
-    
+
     if (pos) {
-      // Move cursor to clicked position
-      // Note: This is simplified - production would need proper position-to-cursor mapping
-      console.log('[mousedown]', pos);
-      
-      // For now, just focus the input layer
-      // TODO: Implement proper click-to-position in Rust
+      editor.setCursor(pos.pageIndex, pos.x, pos.y);
+      updateRenderData(editor, wasmMemory);
       inputLayerRef.current?.focus();
     }
-  }, [editor, wasmMemory, getDocumentPositionFromMouse]);
+  }, [editor, wasmMemory, getDocumentPositionFromMouse, updateRenderData]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     if (!isMouseDown || !editor || !wasmMemory) return;
-    
+
     const pos = getDocumentPositionFromMouse(e.clientX, e.clientY);
-    
+
     if (pos) {
-      // Extend selection while dragging
-      console.log('[mousemove]', pos);
-      
-      // TODO: Implement drag selection in Rust
+      editor.selectTo(pos.pageIndex, pos.x, pos.y);
+      updateRenderData(editor, wasmMemory);
     }
-  }, [isMouseDown, editor, wasmMemory, getDocumentPositionFromMouse]);
+  }, [isMouseDown, editor, wasmMemory, getDocumentPositionFromMouse, updateRenderData]);
 
   const handleMouseUp = useCallback(() => {
     setIsMouseDown(false);
@@ -407,6 +418,36 @@ function App() {
         <div className="toolbar-group">
           <span className="app-title">Mini-Word</span>
         </div>
+
+        {/* Font Controls */}
+        <div className="toolbar-group" style={{ gap: '8px', marginLeft: '20px' }}>
+          <select
+            value={fontFamily}
+            onChange={(e) => setFontFamily(e.target.value)}
+            className="toolbar-select"
+            style={{ height: '24px', borderRadius: '4px', border: '1px solid #ccc' }}
+          >
+            <option value="Menlo">Menlo</option>
+            <option value="Courier New">Courier New</option>
+            <option value="Arial">Arial</option>
+            <option value="Times New Roman">Times New Roman</option>
+            <option value="Verdana">Verdana</option>
+          </select>
+
+          <select
+            value={fontSize}
+            onChange={(e) => setFontSize(Number(e.target.value))}
+            className="toolbar-select"
+            style={{ height: '24px', borderRadius: '4px', border: '1px solid #ccc' }}
+          >
+            {[10, 12, 14, 16, 18, 20, 24, 32].map(size => (
+              <option key={size} value={size}>{size}px</option>
+            ))}
+          </select>
+        </div>
+
+        <div className="toolbar-spacer" />
+
         <div className="toolbar-group">
           <button
             className="toolbar-btn"
@@ -480,8 +521,8 @@ function App() {
               caretColor: 'transparent', // Hide browser caret, we render our own
               color: 'transparent',
               background: 'transparent',
-              fontFamily: 'monospace',
-              fontSize: 14,
+              fontFamily: `"${fontFamily}"`,
+              fontSize: fontSize,
               lineHeight: 1.2,
               whiteSpace: 'pre-wrap',
               overflowWrap: 'break-word',
@@ -503,16 +544,15 @@ function App() {
                     : null
                 }
                 cursorVisible={cursorVisible}
-                selections={renderData.selections.filter(
-                  (s) => s.pageIndex === page.pageIndex
-                )}
                 scale={SCALE}
                 pageGap={PAGE_GAP}
+                fontFamily={fontFamily}
+                fontSize={fontSize}
               />
             ))}
             {/* Empty state */}
             {(!renderData?.pages.length || renderData.pages.every(p => p.lines.length === 0)) && (
-              <div 
+              <div
                 className="empty-placeholder"
                 style={{
                   position: 'absolute',
@@ -545,9 +585,10 @@ interface PageProps {
   constraints: LayoutConstraints;
   cursor: CursorRenderData | null;
   cursorVisible: boolean;
-  selections: SelectionRenderData[];
   scale: number;
   pageGap: number;
+  fontFamily: string;
+  fontSize: number;
 }
 
 /**
@@ -558,7 +599,7 @@ const computeCursorX = (cursor: CursorRenderData, page: PageRenderData, scale: n
   // Find the line containing the cursor by matching Y position
   let targetLineIndex = -1;
   const lineHeight = 14 * 1.2; // font-size * line-height
-  
+
   for (let i = 0; i < page.lines.length; i++) {
     const line = page.lines[i];
     if (cursor.y >= line.y && cursor.y < line.y + lineHeight) {
@@ -573,12 +614,12 @@ const computeCursorX = (cursor: CursorRenderData, page: PageRenderData, scale: n
   }
 
   const line = page.lines[targetLineIndex];
-  
+
   // Find the DOM element for this line
   const lineElement = document.querySelector(
     `[data-page-index="${page.pageIndex}"][data-line-index="${targetLineIndex}"]`
   ) as HTMLElement;
-  
+
   if (!lineElement) {
     return line.x;
   }
@@ -597,7 +638,7 @@ const computeCursorX = (cursor: CursorRenderData, page: PageRenderData, scale: n
       break;
     }
   }
-  
+
   if (!textNode) {
     return line.x;
   }
@@ -608,12 +649,99 @@ const computeCursorX = (cursor: CursorRenderData, page: PageRenderData, scale: n
   const range = document.createRange();
   range.setStart(textNode, 0);
   range.setEnd(textNode, offset);
-  
+
   const rect = range.getBoundingClientRect();
-  
+
   // rect.width is the width from start of text to cursor offset in scaled pixels
   // Convert back to unscaled coordinates by dividing by scale
   return line.x + rect.width / scale;
+};
+
+// Component to render selection highlights based on DOM measurements
+const SelectionHighlights: React.FC<{
+  page: PageRenderData;
+  scale: number;
+}> = ({ page, scale }) => {
+  const [rects, setRects] = useState<{ x: number, y: number, width: number, height: number }[]>([]);
+
+  useLayoutEffect(() => {
+    const newRects: { x: number, y: number, width: number, height: number }[] = [];
+
+    page.lines.forEach((line, lineIndex) => {
+      // Check if line has selection (and not just null)
+      if (line.selectionStart !== null && line.selectionEnd !== null) {
+        const lineElement = document.querySelector(
+          `[data-page-index="${page.pageIndex}"][data-line-index="${lineIndex}"]`
+        ) as HTMLElement;
+
+        if (lineElement) {
+          // Find text node
+          let textNode: Text | null = null;
+          for (let i = 0; i < lineElement.childNodes.length; i++) {
+            const node = lineElement.childNodes[i];
+            if (node.nodeType === Node.TEXT_NODE) {
+              const t = node as Text;
+              // Only use this text node if it's the main text (check length against line text?)
+              // Usually there's only one main text node per line div due to our rendering
+              textNode = t;
+              break;
+            }
+          }
+
+          if (textNode) {
+            // Bounds checks
+            const start = Math.max(0, Math.min(line.selectionStart, textNode.length));
+            const end = Math.max(0, Math.min(line.selectionEnd, textNode.length));
+
+            if (start < end) {
+              // Range for start offset (to determine X)
+              const rangeStart = document.createRange();
+              rangeStart.setStart(textNode, 0);
+              rangeStart.setEnd(textNode, start);
+              const rectStart = rangeStart.getBoundingClientRect();
+              const startWidth = rectStart.width / scale;
+
+              // Range for selection width
+              const rangeSel = document.createRange();
+              rangeSel.setStart(textNode, start);
+              rangeSel.setEnd(textNode, end);
+              const rectSel = rangeSel.getBoundingClientRect();
+              const selWidth = rectSel.width / scale;
+
+              // Position relative to line start
+              // line.x is the absolute X position of the line start in the page
+              const x = line.x + startWidth;
+              const y = line.y;
+              const height = 14 * 1.2; // Use standard line height
+
+              newRects.push({ x, y, width: selWidth, height });
+            }
+          }
+        }
+      }
+    });
+    setRects(newRects);
+  }, [page, scale]);
+
+  return (
+    <>
+      {rects.map((rect, i) => (
+        <div
+          key={i}
+          className="selection"
+          style={{
+            position: 'absolute',
+            left: rect.x * scale,
+            top: rect.y * scale,
+            width: rect.width * scale,
+            height: rect.height * scale,
+            background: 'rgba(59, 130, 246, 0.3)',
+            pointerEvents: 'none',
+          }}
+        />
+      ))}
+    </>
+  );
 };
 
 function Page({
@@ -621,9 +749,10 @@ function Page({
   constraints,
   cursor,
   cursorVisible,
-  selections,
   scale,
   pageGap,
+  fontFamily,
+  fontSize,
 }: PageProps) {
   const pageTop = page.pageIndex * (constraints.pageHeight + pageGap) * scale + pageGap;
   const [cursorX, setCursorX] = useState(0);
@@ -657,30 +786,17 @@ function Page({
       }}
     >
       {/* Selection highlights */}
-      {selections.map((sel, i) => (
-        <div
-          key={i}
-          className="selection"
-          style={{
-            position: 'absolute',
-            left: sel.x * scale,
-            top: sel.y * scale,
-            width: sel.width * scale,
-            height: sel.height * scale,
-            background: 'rgba(59, 130, 246, 0.3)',
-            pointerEvents: 'none',
-          }}
-        />
-      ))}
-
+      <SelectionHighlights page={page} scale={scale} />
       {/* Text lines */}
       {page.lines.map((line, i) => (
-        <TextLine 
-          key={i} 
+        <TextLine
+          key={i}
           line={line}
           lineIndex={i}
           pageIndex={page.pageIndex}
           scale={scale}
+          fontFamily={fontFamily}
+          fontSize={fontSize}
         />
       ))}
 
@@ -724,10 +840,87 @@ interface TextLineProps {
   lineIndex: number;
   pageIndex: number;
   scale: number;
+  fontFamily: string;
+  fontSize: number;
 }
 
-const TextLine = ({ line, lineIndex, pageIndex, scale }: TextLineProps) => {
+const TextLine = ({ line, lineIndex, pageIndex, scale, fontFamily, fontSize }: TextLineProps) => {
+  // If we have specific styles, render them
+  if (line.styles && line.styles.length > 0) {
+    const content = [];
+    let currentIdx = 0;
+
+    // Sort styles by start index just in case
+    // (Rust should guarantee this but good to be safe)
+
+    for (const span of line.styles) {
+      // Gap before span?
+      if (span.start > currentIdx) {
+        content.push(
+          <span key={`gap-${currentIdx}`} style={{
+            fontFamily: `"${fontFamily}"`,
+            fontSize: fontSize * scale,
+          }}>
+            {line.text.substring(currentIdx, span.start)}
+          </span>
+        );
+      }
+
+      const fontData = fontService.getFontDetails(span.fontId);
+      const spanFamily = fontData?.family || fontFamily;
+      const spanSize = (fontData?.size || fontSize) * scale;
+
+      content.push(
+        <span key={`span-${span.start}`} style={{
+          fontFamily: `"${spanFamily}"`,
+          fontSize: spanSize,
+        }}>
+          {line.text.substring(span.start, span.start + span.len)}
+        </span>
+      );
+
+      currentIdx = span.start + span.len;
+    }
+
+    // Remaining text
+    if (currentIdx < line.text.length) {
+      content.push(
+        <span key={`gap-${currentIdx}`} style={{
+          fontFamily: `"${fontFamily}"`,
+          fontSize: fontSize * scale,
+        }}>
+          {line.text.substring(currentIdx)}
+        </span>
+      );
+    }
+
+    return (
+      <div
+        className="text-line"
+        data-page-index={pageIndex}
+        data-line-index={lineIndex}
+        style={{
+          position: 'absolute',
+          left: line.x * scale,
+          top: line.y * scale,
+          lineHeight: 1.2,
+          whiteSpace: 'pre',
+          color: '#1a1a1a',
+        }}
+      >
+        {line.listMarker && (
+          <span style={{ marginRight: 8, fontFamily: `"${fontFamily}"`, fontSize: fontSize * scale }}>
+            {line.listMarker}
+          </span>
+        )}
+        {content.length > 0 ? content : '\u200B'}
+      </div>
+    );
+  }
+
+  // Fallback / legacy rendering
   const getFontSize = () => {
+    const baseSize = fontSize;
     if (line.isHeading && line.headingLevel) {
       const sizes: Record<number, number> = {
         1: 24,
@@ -737,9 +930,11 @@ const TextLine = ({ line, lineIndex, pageIndex, scale }: TextLineProps) => {
         5: 14,
         6: 13,
       };
-      return sizes[line.headingLevel] || 14;
+      // Scale heading based on default 14px base
+      const defaultSize = sizes[line.headingLevel] || 14;
+      return (defaultSize / 14) * baseSize;
     }
-    return 14;
+    return baseSize;
   };
 
   const getFontWeight = () => {
@@ -756,7 +951,7 @@ const TextLine = ({ line, lineIndex, pageIndex, scale }: TextLineProps) => {
         position: 'absolute',
         left: line.x * scale,
         top: line.y * scale,
-        fontFamily: 'monospace',
+        fontFamily: `"${fontFamily}"`,
         fontSize: getFontSize() * scale,
         fontWeight: getFontWeight(),
         lineHeight: 1.2,

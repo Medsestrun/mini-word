@@ -22,22 +22,20 @@
  *   - page_index
  *   - line_count
  *   - per line: [text_offset, text_len, text_utf16_offset, text_utf16_len,
- *               block_type, flags, marker_offset, marker_len, marker_utf16_offset, marker_utf16_len]
+ *               block_type, flags, marker_offset, marker_len, marker_utf16_offset, marker_utf16_len,
+ *               sel_start, sel_end]
  *     text_offset/text_len: byte offsets in UTF-8 buffer (for validation)
  *     text_utf16_offset/text_utf16_len: offsets for JS substring (after single decode)
  *     marker: only read if marker_len > 0, otherwise marker_offset is ignored
+ *     sel_start/sel_end: UTF-16 offsets relative to line text start (0xFFFFFFFF if no selection)
  * 
  * At u32_cursor_offset (if cursor_present):
  *   - cursor indices: [page_index, utf16_offset_in_line]
- * 
- * At u32_selection_offset (if selection_count > 0):
- *   - per selection indices: [page_index] (selection_count times)
  * 
  * f32 buffer:
  * - per page: [y_offset, width, height]
  * - per line: [x, y]
  * - cursor geometry (if present): [x, y, height]
- * - per selection geometry: [x, y, width, height] (selection_count times)
  */
 
 // Protocol constants (must match Rust)
@@ -62,7 +60,6 @@ export interface RenderData {
   version: number;
   pages: PageRenderData[];
   cursor: CursorRenderData | null;
-  selections: SelectionRenderData[];
 }
 
 export interface PageRenderData {
@@ -82,6 +79,15 @@ export interface LineRenderData {
   headingLevel: number | null;
   isListItem: boolean;
   listMarker: string | null;
+  selectionStart: number | null;
+  selectionEnd: number | null;
+  styles: StyleSpan[];
+}
+
+export interface StyleSpan {
+  start: number;
+  len: number;
+  fontId: number;
 }
 
 export interface CursorRenderData {
@@ -91,14 +97,6 @@ export interface CursorRenderData {
   pageIndex: number;
   /** UTF-16 code unit offset within the line for correct JS text measurement */
   utf16OffsetInLine: number;
-}
-
-export interface SelectionRenderData {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  pageIndex: number;
 }
 
 const blockTypeToString = (blockType: number): string => {
@@ -138,12 +136,15 @@ export const decodeRenderData = (
   f32Ptr: number,
   f32Len: number,
   textPtr: number,
-  textLen: number
+  textLen: number,
+  stylePtr: number,
+  styleLen: number
 ): RenderData => {
   // Create views into WASM memory
   const u32View = new Uint32Array(memory.buffer, u32Ptr, u32Len);
   const f32View = new Float32Array(memory.buffer, f32Ptr, f32Len);
   const textView = new Uint8Array(memory.buffer, textPtr, textLen);
+  const styleView = new Uint32Array(memory.buffer, stylePtr, styleLen);
 
   // Validate header
   const magic = u32View[0];
@@ -162,12 +163,12 @@ export const decodeRenderData = (
   const version = versionLo + versionHi * 0x100000000;
   const pageCount = u32View[4];
   const cursorPresent = u32View[5] === 1;
-  const selectionCount = u32View[6];
-  // u32View[7] is text_buffer_len (we already know this from textLen)
+  // const selectionCount = u32View[6]; // Deprecated
+  // u32View[7] is text_buffer_len
   const u32CursorOffset = u32View[8];
-  const u32SelectionOffset = u32View[9];
+  // const u32SelectionOffset = u32View[9]; // Deprecated
   const f32CursorOffset = u32View[10];
-  const f32SelectionOffset = u32View[11];
+  // const f32SelectionOffset = u32View[11]; // Deprecated
 
   let u32Idx = 12; // Pages start after header
   let f32Idx = 0;
@@ -190,17 +191,21 @@ export const decodeRenderData = (
     const lines: LineRenderData[] = [];
 
     for (let l = 0; l < lineCount; l++) {
-      // Read all 10 u32 values per line (was 6, now 10)
-      u32Idx++;  // skip text_offset (byte offset, not needed for substring)
-      u32Idx++;  // skip text_length (byte length, not needed for substring)
-      const textUtf16Offset = u32View[u32Idx++];   // UTF-16 offset for substring
-      const textUtf16Len = u32View[u32Idx++];      // UTF-16 length for substring
+      // Read all 14 u32 values per line (was 12)
+      u32Idx++;  // skip text_offset
+      u32Idx++;  // skip text_length
+      const textUtf16Offset = u32View[u32Idx++];
+      const textUtf16Len = u32View[u32Idx++];
       const blockType = u32View[u32Idx++];
       const flags = u32View[u32Idx++];
-      u32Idx++;  // skip marker_offset (byte offset, not needed for substring)
-      u32Idx++;  // skip marker_len (byte length, not needed for substring)
-      const markerUtf16Offset = u32View[u32Idx++]; // UTF-16 offset
-      const markerUtf16Len = u32View[u32Idx++];    // UTF-16 length
+      u32Idx++;  // skip marker_offset
+      u32Idx++;  // skip marker_len
+      const markerUtf16Offset = u32View[u32Idx++];
+      const markerUtf16Len = u32View[u32Idx++];
+      const selStart = u32View[u32Idx++];
+      const selEnd = u32View[u32Idx++];
+      const styleStartIdx = u32View[u32Idx++];
+      const styleCount = u32View[u32Idx++];
 
       const x = f32View[f32Idx++];
       const y = f32View[f32Idx++];
@@ -216,6 +221,21 @@ export const decodeRenderData = (
       const isHeading = (flags & FLAG_IS_HEADING) !== 0;
       const isListItem = (flags & FLAG_IS_LIST_ITEM) !== 0;
 
+      // Check for valid selection range (u32::MAX = 0xFFFFFFFF)
+      const hasSelection = selStart !== 0xFFFFFFFF;
+
+      // Decode styles
+      const styles: StyleSpan[] = [];
+      if (styleCount > 0) {
+        let sIdx = styleStartIdx;
+        for (let s = 0; s < styleCount; s++) {
+          const start = styleView[sIdx++];
+          const len = styleView[sIdx++];
+          const fontId = styleView[sIdx++];
+          styles.push({ start, len, fontId });
+        }
+      }
+
       lines.push({
         x,
         y,
@@ -225,6 +245,9 @@ export const decodeRenderData = (
         headingLevel: getHeadingLevel(blockType),
         isListItem,
         listMarker,
+        selectionStart: hasSelection ? selStart : null,
+        selectionEnd: hasSelection ? selEnd : null,
+        styles,
       });
     }
 
@@ -252,29 +275,10 @@ export const decodeRenderData = (
     cursor = { x, y, height, pageIndex, utf16OffsetInLine };
   }
 
-  // Decode selections using offset table (random access for both u32 and f32)
-  const selections: SelectionRenderData[] = [];
-  if (selectionCount > 0 && u32SelectionOffset > 0 && f32SelectionOffset > 0) {
-    for (let s = 0; s < selectionCount; s++) {
-      // u32: index at u32SelectionOffset
-      const pageIndex = u32View[u32SelectionOffset + s];
-      
-      // f32: geometry at f32SelectionOffset (random access, not sequential)
-      const f32Base = f32SelectionOffset + s * 4; // Each selection has 4 f32 values
-      const x = f32View[f32Base];
-      const y = f32View[f32Base + 1];
-      const width = f32View[f32Base + 2];
-      const height = f32View[f32Base + 3];
-      
-      selections.push({ x, y, width, height, pageIndex });
-    }
-  }
-
   return {
     version,
     pages,
     cursor,
-    selections,
   };
 };
 
@@ -297,8 +301,10 @@ export const getRenderDataFromEditor = (
   const f32Len = editor.getF32Len();
   const textPtr = editor.getTextPtr();
   const textLen = editor.getTextLen();
+  const stylePtr = editor.getStylePtr();
+  const styleLen = editor.getStyleLen();
 
-  return decodeRenderData(memory, u32Ptr, u32Len, f32Ptr, f32Len, textPtr, textLen);
+  return decodeRenderData(memory, u32Ptr, u32Len, f32Ptr, f32Len, textPtr, textLen, stylePtr, styleLen);
 };
 
 /**
@@ -310,8 +316,11 @@ export interface WasmEditorInterface {
   deleteBackward(): boolean;
   deleteForward(): boolean;
   moveCursor(horizontal: number, vertical: number, extendSelection: boolean): void;
+  setCursor(pageIndex: number, x: number, y: number): void;
+  selectTo(pageIndex: number, x: number, y: number): void;
   undo(): boolean;
   redo(): boolean;
+  setFontMetrics(lineHeight: number, charWidths: Float32Array, defaultWidth: number): void;
   getText(): string;
   getPageCount(): number;
   selectAll(): void;
@@ -326,6 +335,12 @@ export interface WasmEditorInterface {
   getF32Len(): number;
   getTextPtr(): number;
   getTextLen(): number;
+  getStylePtr(): number;
+  getStyleLen(): number;
+
+  // Font/Style methods
+  addFont(id: number, lineHeight: number, charWidths: Float32Array, defaultWidth: number): void;
+  formatSelection(fontId: number): void;
 
   // Direct layout constraint accessors
   getPageWidth(): number;

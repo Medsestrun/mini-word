@@ -44,6 +44,7 @@ impl Document {
                 kind: BlockKind::Paragraph,
                 start_offset: 0,
                 byte_len: 0,
+                styles: Vec::new(),
             },
         );
 
@@ -82,6 +83,7 @@ impl Document {
                     kind: BlockKind::Paragraph,
                     start_offset: offset,
                     byte_len: para_len,
+                    styles: Vec::new(),
                 },
             );
             doc.paragraph_index.insert(para_id, offset, para_len);
@@ -100,6 +102,7 @@ impl Document {
                     kind: BlockKind::Paragraph,
                     start_offset: 0,
                     byte_len: 0,
+                    styles: Vec::new(),
                 },
             );
             doc.paragraph_index.insert(para_id, 0, 0);
@@ -153,6 +156,11 @@ impl Document {
         self.paragraph_index.iter()
     }
 
+    /// Get paragraph order starting from an offset
+    pub fn paragraphs_from(&self, start_offset: usize) -> impl Iterator<Item = ParagraphId> + '_ {
+        self.paragraph_index.iter_from(start_offset)
+    }
+
     /// Get paragraph count
     pub fn paragraph_count(&self) -> usize {
         self.paragraph_index.len()
@@ -176,9 +184,19 @@ impl Document {
         }
     }
 
+    /// Get the paragraph and its start offset containing an offset
+    pub fn para_entry_at_offset(&self, offset: usize) -> (ParagraphId, usize) {
+        self.paragraph_index.para_at_offset(offset)
+    }
+
     /// Get the paragraph containing an offset
     pub fn para_at_offset(&self, offset: usize) -> ParagraphId {
         self.paragraph_index.para_at_offset(offset).0
+    }
+
+    /// Get previous paragraph
+    pub fn prev_paragraph(&self, para_id: ParagraphId) -> Option<ParagraphId> {
+        self.paragraph_index.prev(para_id)
     }
 
     /// Get text range
@@ -275,36 +293,96 @@ impl Document {
         if newline_positions.is_empty() {
             // No new paragraphs, just update the current one
             if let Some(meta) = self.blocks.get_mut(&para_id) {
+                let offset_in_para = position.0 - meta.start_offset;
+                meta.on_insert(offset_in_para, text.len());
                 meta.byte_len += text.len();
             }
             self.paragraph_index.update_lengths_after(position.0, text.len() as isize);
         } else {
             // Split paragraph at newlines
+            // First, insert text into original paragraph styles (logically)
+            // Then split those styles
+            if let Some(meta) = self.blocks.get_mut(&para_id) {
+                 let offset_in_para = position.0 - meta.start_offset;
+                 meta.on_insert(offset_in_para, text.len());
+                 // Note: meta.byte_len is NOT updated yet, we will split it manually
+            }
+
             let original_meta = self.blocks.get(&para_id).cloned();
 
             if let Some(meta) = original_meta {
                 let offset_in_para = position.0.saturating_sub(para_start);
                 let original_byte_len = meta.byte_len;
+                // Since we virtually inserted text, the "logical" length is len + text.len()
+                // But we never stored that back into byte_len.
+                // However, on_insert updated the styles.
+                
                 let mut current_start = meta.start_offset;
+                // We need to carry over styles from previous split to next
+                let mut current_styles = meta.styles; // These are expanded styles
 
                 // First segment stays in original paragraph
-                let first_len = offset_in_para + newline_positions[0];
+                let first_seg_len = offset_in_para + newline_positions[0];
+                
+                // Extract styles for first segment: [0, first_seg_len)
+                // The rest goes to next.
+                let mut rest_styles = Vec::new(); // Placeholder
+                
+                // Helper to split a list of styles
+                let split_styles = |styles: Vec<crate::document::block::StyleSpan>, split_at: usize| -> (Vec<crate::document::block::StyleSpan>, Vec<crate::document::block::StyleSpan>) {
+                    let mut first = Vec::new();
+                    let mut second = Vec::new();
+                    for s in styles {
+                        if s.end <= split_at {
+                            first.push(s);
+                        } else if s.start >= split_at {
+                            let mut new_s = s;
+                            new_s.start -= split_at;
+                            new_s.end -= split_at;
+                            second.push(new_s);
+                        } else {
+                            // Split
+                            let mut s1 = s.clone();
+                            s1.end = split_at;
+                            first.push(s1);
+                            
+                            let mut s2 = s;
+                            s2.start = 0;
+                            s2.end -= split_at;
+                            second.push(s2);
+                        }
+                    }
+                    (first, second)
+                };
+
+                let (first_styles, remainder) = split_styles(current_styles, first_seg_len);
+                rest_styles = remainder;
+
                 if let Some(m) = self.blocks.get_mut(&para_id) {
-                    m.byte_len = first_len;
+                    m.byte_len = first_seg_len;
+                    m.styles = first_styles;
                 }
-                self.paragraph_index.update_length(para_id, first_len);
-                current_start += first_len + 1; // +1 for newline
+                self.paragraph_index.update_length(para_id, first_seg_len);
+                current_start += first_seg_len + 1; // +1 for newline
 
                 // Create new paragraphs for each segment
                 for (i, &nl_pos) in newline_positions.iter().enumerate() {
-                    let next_end = if i + 1 < newline_positions.len() {
-                        newline_positions[i + 1]
+                    let next_nl_pos = if i + 1 < newline_positions.len() {
+                        Some(newline_positions[i + 1])
                     } else {
-                        // Last segment: remaining text after last newline
-                        text.len() + original_byte_len.saturating_sub(offset_in_para)
+                        None
+                    };
+                    
+                    let segment_len = if let Some(next_pos) = next_nl_pos {
+                        next_pos - nl_pos - 1
+                    } else {
+                        // Last segment
+                        original_byte_len + text.len() - (offset_in_para + nl_pos + 1)
                     };
 
-                    let segment_len = next_end.saturating_sub(nl_pos).saturating_sub(1);
+                    let (seg_styles, remainder) = split_styles(rest_styles, segment_len);
+                    rest_styles = remainder;
+
                     let new_para = ParagraphId(self.next_para_id);
                     self.next_para_id += 1;
 
@@ -314,6 +392,7 @@ impl Document {
                             kind: BlockKind::Paragraph,
                             start_offset: current_start,
                             byte_len: segment_len,
+                            styles: seg_styles,
                         },
                     );
                     self.paragraph_index.insert_after(para_id, new_para, current_start, segment_len);
@@ -368,6 +447,8 @@ impl Document {
         if start_para == end_para {
             // Single paragraph affected
             if let Some(meta) = self.blocks.get_mut(&start_para) {
+                let offset_in_para = start.0 - meta.start_offset;
+                meta.on_delete(offset_in_para, offset_in_para + delete_len);
                 meta.byte_len = meta.byte_len.saturating_sub(delete_len);
             }
             self.paragraph_index.update_lengths_after(start.0, -(delete_len as isize));
@@ -387,12 +468,28 @@ impl Document {
                 if in_range {
                     if para_id == end_para {
                         // Merge end para content into start para
-                        if let Some(end_meta) = self.blocks.get(&end_para) {
+                        
+                        // We first need to CLONE end_meta to avoid borrowing conflict
+                        let end_meta_clone = self.blocks.get(&end_para).cloned();
+
+                        if let Some(end_meta) = end_meta_clone {
                             let offset_in_end = end.0.saturating_sub(end_meta.start_offset);
                             let remaining_in_end = end_meta.byte_len.saturating_sub(offset_in_end);
+                            
+                            // Adjust deleted styles in start_para
                             if let Some(start_meta) = self.blocks.get_mut(&start_para) {
-                                let kept_in_start = start.0.saturating_sub(start_para_offset);
-                                start_meta.byte_len = kept_in_start + remaining_in_end;
+                                let offset_in_start = start.0.saturating_sub(start_para_offset);
+                                start_meta.on_delete(offset_in_start, start_meta.byte_len);
+                                
+                                // Adjust deleted styles in end_meta (before merging)
+                                let mut end_meta_mod = end_meta.clone();
+                                end_meta_mod.on_delete(0, offset_in_end);
+                                
+                                // Merge styles
+                                let new_start_len = offset_in_start;
+                                start_meta.byte_len = new_start_len + remaining_in_end;
+                                
+                                start_meta.append_styles(end_meta_mod.styles, new_start_len);
                             }
                         }
                         self.blocks.remove(&end_para);
@@ -427,6 +524,65 @@ impl Document {
             if meta.start_offset > after_offset {
                 meta.start_offset = (meta.start_offset as isize + delta) as usize;
             }
+        }
+    }
+
+    /// Format a range of text with a specific font
+    pub fn format_range(&mut self, start: AbsoluteOffset, end: AbsoluteOffset, font_id: crate::layout::font::FontId) -> EditResult {
+        let mut affected = SmallVec::new();
+        
+        if start.0 >= end.0 {
+             return EditResult {
+                version: self.version,
+                affected_paragraphs: affected,
+                created_paragraphs: SmallVec::new(),
+                deleted_paragraphs: SmallVec::new(),
+                new_cursor: self.offset_to_position(start),
+            };
+        }
+
+        self.version += 1;
+        
+        // Find paragraphs in range
+        let (p_start_id, _) = self.paragraph_index.para_at_offset(start.0);
+        let (p_end_id, _) = self.paragraph_index.para_at_offset(end.0.saturating_sub(1));
+        
+        let mut in_range = false;
+        let mut paras_to_update = Vec::new();
+        
+        for para_id in self.paragraph_index.iter() {
+            if para_id == p_start_id { in_range = true; }
+            
+            if in_range {
+                paras_to_update.push(para_id);
+                if para_id == p_end_id { break; }
+            }
+        }
+        
+        for para_id in paras_to_update {
+            if let Some(meta) = self.blocks.get_mut(&para_id) {
+                let p_start = meta.start_offset;
+                let p_end = p_start + meta.byte_len;
+                
+                let range_start = start.0.max(p_start);
+                let range_end = end.0.min(p_end);
+                
+                if range_start < range_end {
+                     let rel_start = range_start - p_start;
+                     let rel_end = range_end - p_start;
+                     
+                     meta.format_range(rel_start, rel_end, font_id);
+                     affected.push(para_id);
+                }
+            }
+        }
+        
+        EditResult {
+            version: self.version,
+            affected_paragraphs: affected,
+            created_paragraphs: SmallVec::new(),
+            deleted_paragraphs: SmallVec::new(),
+            new_cursor: self.offset_to_position(end),
         }
     }
 

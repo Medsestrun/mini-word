@@ -1,57 +1,18 @@
 //! Line breaking algorithm
 
 use crate::document::{BlockKind, BlockMeta, ParagraphId};
-use crate::layout::engine::{ClusterInfo, LineLayout, ParagraphLayout, BASELINE, INDENT_WIDTH, LINE_HEIGHT};
+use crate::layout::engine::{ClusterInfo, LineLayout, ParagraphLayout, BASELINE, INDENT_WIDTH};
+use crate::layout::font::FontMetrics;
 use std::hash::{Hash, Hasher};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Character width provider (simplified - assumes monospace)
-pub struct CharWidthProvider {
-    /// Default character width
-    default_width: f32,
-}
-
-impl Default for CharWidthProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CharWidthProvider {
-    pub fn new() -> Self {
-        Self { default_width: 8.0 }
-    }
-
-    /// Get width of a grapheme cluster
-    pub fn width(&self, grapheme: &str) -> f32 {
-        // Simplified: each grapheme has the same width
-        // In a real implementation, this would query font metrics
-        if grapheme == "\t" {
-            self.default_width * 4.0
-        } else if grapheme.chars().all(|c| c.is_control()) {
-            0.0
-        } else {
-            self.default_width * grapheme.chars().count() as f32
-        }
-    }
-}
-
 /// Line breaker
-pub struct LineBreaker {
-    char_widths: CharWidthProvider,
-}
-
-impl Default for LineBreaker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[derive(Default)]
+pub struct LineBreaker;
 
 impl LineBreaker {
     pub fn new() -> Self {
-        Self {
-            char_widths: CharWidthProvider::new(),
-        }
+        Self
     }
 
     /// Layout a paragraph into lines
@@ -61,6 +22,7 @@ impl LineBreaker {
         text: &str,
         block_meta: &BlockMeta,
         max_width: f32,
+        font_library: &crate::layout::font::FontLibrary,
     ) -> ParagraphLayout {
         // Adjust width for list indentation
         let effective_width = match &block_meta.kind {
@@ -70,16 +32,20 @@ impl LineBreaker {
             _ => max_width,
         };
 
-        let line_height = LINE_HEIGHT * block_meta.kind.line_height_multiplier();
-
+        // Determine default font (ID 0 usually)
+        let default_font_id = crate::layout::font::FontId(0);
+        
         let mut lines = Vec::new();
 
         if text.is_empty() {
+             // Empty paragraph height depends on default font?
+             let height = font_library.get(default_font_id).map(|m| m.line_height).unwrap_or(16.0);
+             
             // Empty paragraph still has one line
             lines.push(LineLayout {
                 byte_range: 0..0,
                 clusters: Vec::new(),
-                height: line_height,
+                height,
                 baseline: BASELINE,
                 width: 0.0,
             });
@@ -89,24 +55,49 @@ impl LineBreaker {
             let mut clusters = Vec::new();
             let mut last_break_point: Option<usize> = None;
             let mut last_break_x: f32 = 0.0;
+            
+            // Track line height (max of current line)
+            let mut current_line_height: f32 = 0.0;
 
             for (byte_idx, grapheme) in text.grapheme_indices(true) {
+                // Determine font for this grapheme
+                let font_id = block_meta.styles.iter()
+                    .find(|s| byte_idx >= s.start && byte_idx < s.end)
+                    .map(|s| s.font_id)
+                    .unwrap_or(default_font_id);
+                    
+                let metrics = font_library.get(font_id)
+                    .or_else(|| font_library.get(default_font_id))
+                    .expect("Default font missing");
+
+                current_line_height = current_line_height.max(metrics.line_height);
+
                 // Check for explicit line break
                 if grapheme == "\n" {
                     lines.push(LineLayout {
                         byte_range: line_start..byte_idx,
                         clusters: std::mem::take(&mut clusters),
-                        height: line_height,
+                        height: if current_line_height == 0.0 { metrics.line_height } else { current_line_height },
                         baseline: BASELINE,
                         width: x,
                     });
                     line_start = byte_idx + grapheme.len();
                     x = 0.0;
                     last_break_point = None;
+                    current_line_height = 0.0;
                     continue;
                 }
 
-                let cluster_width = self.char_widths.width(grapheme);
+                // Calculate width using provided metrics
+                let cluster_width = if grapheme == "\t" {
+                    metrics.default_width * 4.0
+                } else if grapheme.chars().all(|c| c.is_control()) {
+                    0.0
+                } else if grapheme.len() == 1 {
+                     metrics.width(grapheme.chars().next().unwrap())
+                } else {
+                     grapheme.chars().map(|c| metrics.width(c)).sum()
+                };
 
                 // Track potential break points (after whitespace)
                 if grapheme.chars().all(|c| c.is_whitespace()) {
@@ -134,11 +125,16 @@ impl LineBreaker {
                     let line_width = line_clusters.last()
                         .map(|c| c.x + c.width)
                         .unwrap_or(0.0);
+                    
+                    // Note: height should be calculated from the clusters in the line properly if we wrapped.
+                    // But we used accumulating max height. 
+                    // Simplifying assumption: line height is determined by max height of content *seen so far* on this line.
+                    // If we wrap, the next line starts fresh.
 
                     lines.push(LineLayout {
                         byte_range: line_start..break_offset,
                         clusters: line_clusters,
-                        height: line_height,
+                        height: current_line_height,
                         baseline: BASELINE,
                         width: line_width,
                     });
@@ -151,6 +147,7 @@ impl LineBreaker {
                     line_start = break_offset;
                     x -= break_x;
                     last_break_point = None;
+                    current_line_height = metrics.line_height; // Start next line with current char's height
                 }
 
                 clusters.push(ClusterInfo {
@@ -163,10 +160,17 @@ impl LineBreaker {
 
             // Final line
             if line_start <= text.len() {
+                // If last line is empty (e.g. ended with newline), height might be 0
+                let final_height = if current_line_height == 0.0 { 
+                     font_library.get(default_font_id).map(|m| m.line_height).unwrap_or(16.0)
+                } else {
+                    current_line_height
+                };
+
                 lines.push(LineLayout {
                     byte_range: line_start..text.len(),
                     clusters,
-                    height: line_height,
+                    height: final_height,
                     baseline: BASELINE,
                     width: x,
                 });
@@ -174,19 +178,15 @@ impl LineBreaker {
         }
 
         let total_height = lines.iter().map(|l| l.height).sum::<f32>()
-            + self.paragraph_spacing(block_meta);
-
+            + (block_meta.kind.spacing_after() * 16.0); // Spacing after uses default/fixed unit? 
+            // Or should correspond to last line height?
+            
         ParagraphLayout {
             para_id,
             lines,
             total_height,
             content_hash: hash_text(text),
         }
-    }
-
-    /// Get spacing after paragraph
-    fn paragraph_spacing(&self, block_meta: &BlockMeta) -> f32 {
-        LINE_HEIGHT * block_meta.kind.spacing_after()
     }
 }
 
@@ -212,17 +212,20 @@ mod tests {
             kind: BlockKind::Paragraph,
             start_offset: 0,
             byte_len: 0,
+            styles: Vec::new(),
         }
     }
 
     #[test]
     fn test_empty_paragraph() {
         let breaker = test_breaker();
+        let lib = crate::layout::font::FontLibrary::default();
         let layout = breaker.layout_paragraph(
             ParagraphId(0),
             "",
             &para_meta(),
             100.0,
+            &lib,
         );
 
         assert_eq!(layout.lines.len(), 1);
@@ -232,11 +235,13 @@ mod tests {
     #[test]
     fn test_single_line() {
         let breaker = test_breaker();
+        let lib = crate::layout::font::FontLibrary::default();
         let layout = breaker.layout_paragraph(
             ParagraphId(0),
             "Hello",
             &para_meta(),
             100.0,
+            &lib,
         );
 
         assert_eq!(layout.lines.len(), 1);
@@ -247,12 +252,20 @@ mod tests {
     #[test]
     fn test_line_wrap() {
         let breaker = test_breaker();
+        let mut lib = crate::layout::font::FontLibrary::new();
+        lib.set(crate::layout::font::FontId(0), crate::layout::font::FontMetrics { 
+             line_height: 10.0, 
+             char_widths: vec![8.0; 256], 
+             default_width: 8.0 
+        });
+
         // With 8px per char, 40px width = 5 chars per line
         let layout = breaker.layout_paragraph(
             ParagraphId(0),
             "Hello World",
             &para_meta(),
             40.0,
+            &lib,
         );
 
         assert_eq!(layout.lines.len(), 2);
@@ -261,11 +274,13 @@ mod tests {
     #[test]
     fn test_explicit_newline() {
         let breaker = test_breaker();
+        let lib = crate::layout::font::FontLibrary::default();
         let layout = breaker.layout_paragraph(
             ParagraphId(0),
             "Hello\nWorld",
             &para_meta(),
             1000.0,
+            &lib,
         );
 
         assert_eq!(layout.lines.len(), 2);

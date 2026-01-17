@@ -270,6 +270,11 @@ impl Editor {
     pub fn page_count(&self) -> usize {
         self.layout.page_count()
     }
+
+    /// Force layout update on next tick
+    pub fn mark_dirty(&mut self) {
+        self.layout_dirty = true;
+    }
 }
 
 #[cfg(test)]

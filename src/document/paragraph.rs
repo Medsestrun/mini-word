@@ -146,6 +146,11 @@ impl ParagraphIndex {
         self.order.iter().copied()
     }
 
+    /// Iterate over paragraphs starting from the given offset
+    pub fn iter_from(&self, start_offset: usize) -> impl Iterator<Item = ParagraphId> + '_ {
+        self.offset_to_para.range(start_offset..).map(|(_, v)| v).copied()
+    }
+
     /// Get paragraph count
     pub fn len(&self) -> usize {
         self.order.len()

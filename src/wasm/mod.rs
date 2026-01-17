@@ -13,9 +13,7 @@ use flat_buffer::{
     HEADER_SIZE,
     U32_PER_LINE,
     U32_PER_CURSOR,
-    U32_PER_SELECTION,
     F32_PER_CURSOR,
-    F32_PER_SELECTION,
 };
 
 /// Get access to WASM memory for zero-copy data access
@@ -176,6 +174,26 @@ impl WasmEditor {
         self.insert_text("\n");
     }
 
+    /// Update font metrics from the browser
+    #[wasm_bindgen(js_name = setFontMetrics)]
+    /// Update font metrics from the browser
+    #[wasm_bindgen(js_name = setFontMetrics)]
+    pub fn set_font_metrics(&mut self, line_height: f32, char_widths: &[f32], default_width: f32) {
+        let metrics = crate::layout::FontMetrics::new(
+            line_height,
+            char_widths.to_vec(),
+            default_width,
+        );
+        
+        // Treat as default font (ID 0)
+        self.editor.layout.font_library.set(crate::layout::font::FontId(0), metrics);
+        
+        // Full relayout with new metrics
+        self.editor.layout.invalidate_all();
+        self.editor.mark_dirty();
+        self.editor.update_layout();
+    }
+
     // =========================================================================
     // Zero-copy render buffer API
     // =========================================================================
@@ -191,15 +209,16 @@ impl WasmEditor {
         // Pre-calculate buffer sizes to avoid reallocation (critical: JS holds pointers to these buffers)
         let mut total_lines = 0;
         let mut total_text_bytes = 0;
+        let mut total_styles = 0;
         let mut cursor_count = 0;
-        let mut selection_count = 0;
-
+        
         for page in &display_list.pages {
             for item in &page.items {
                 match item {
-                    crate::render::DisplayItem::TextRun { text, block_kind, .. } => {
+                    crate::render::DisplayItem::TextRun { text, block_kind, styles, .. } => {
                         total_lines += 1;
                         total_text_bytes += text.len();
+                        total_styles += styles.len();
                         
                         // Add marker length if present
                         if let BlockKind::ListItem { marker, .. } = block_kind {
@@ -209,9 +228,6 @@ impl WasmEditor {
                     crate::render::DisplayItem::Caret { .. } => {
                         cursor_count = 1;
                     }
-                    crate::render::DisplayItem::SelectionRect { .. } => {
-                        selection_count += 1;
-                    }
                     _ => {}
                 }
             }
@@ -219,8 +235,8 @@ impl WasmEditor {
 
         // Estimate buffer sizes
         let page_count = display_list.pages.len();
-        let u32_needed = HEADER_SIZE + page_count * 2 + total_lines * U32_PER_LINE + cursor_count * U32_PER_CURSOR + selection_count * U32_PER_SELECTION;
-        let f32_needed = page_count * 3 + total_lines * 2 + cursor_count * F32_PER_CURSOR + selection_count * F32_PER_SELECTION;
+        let u32_needed = HEADER_SIZE + page_count * 2 + total_lines * U32_PER_LINE + cursor_count * U32_PER_CURSOR + total_styles * flat_buffer::U32_PER_STYLE;
+        let f32_needed = page_count * 3 + total_lines * 2 + cursor_count * F32_PER_CURSOR;
         let text_needed = total_text_bytes;
 
         // Pre-allocate buffers to avoid reallocation during rendering
@@ -232,12 +248,11 @@ impl WasmEditor {
             display_list.pages.len() as u32,
         );
 
-        // Collect cursor and selections separately - they must be written AFTER all pages/lines
+        // Collect cursor separately - it must be written AFTER all pages/lines
         // cursor_data: (x, y, height, page_index, utf16_offset_in_line)
         let mut cursor_data: Option<(f32, f32, f32, usize, usize)> = None;
-        let mut selections: Vec<(f32, f32, f32, f32, usize)> = Vec::new();
 
-        // First pass: write pages and lines, collect cursor and selections
+        // First pass: write pages and lines, collect cursor
         for page in &display_list.pages {
             let page_y = page.page_index as f32 * constraints.page_height;
             let line_count_idx = self.render_buffer.begin_page(
@@ -251,7 +266,7 @@ impl WasmEditor {
 
             for item in &page.items {
                 match item {
-                    crate::render::DisplayItem::TextRun { position, text, block_kind, .. } => {
+                    crate::render::DisplayItem::TextRun { position, text, block_kind, selection_range, styles, id: _ } => {
                         let (block_type, flags) = block_kind_to_opcode(block_kind);
                         
                         let list_marker = if let BlockKind::ListItem { marker, .. } = block_kind {
@@ -267,16 +282,14 @@ impl WasmEditor {
                             block_type,
                             flags,
                             list_marker.as_deref(),
+                            *selection_range,
+                            styles,
                         );
                         line_count += 1;
                     }
                     crate::render::DisplayItem::Caret { position, height, utf16_offset_in_line } => {
                         // Collect cursor data to write after all pages
                         cursor_data = Some((position.x, position.y, *height, page.page_index, *utf16_offset_in_line));
-                    }
-                    crate::render::DisplayItem::SelectionRect { rect } => {
-                        // Collect selection data to write after all pages
-                        selections.push((rect.x, rect.y, rect.width, rect.height, page.page_index));
                     }
                     _ => {}
                 }
@@ -285,16 +298,11 @@ impl WasmEditor {
             self.render_buffer.set_line_count(line_count_idx, line_count);
         }
 
-        // Second pass: write cursor and selections after all pages/lines
+        // Second pass: write cursor after all pages/lines
         if let Some((x, y, height, page_index, utf16_offset)) = cursor_data {
             self.render_buffer.write_cursor(x, y, height, page_index, utf16_offset);
         }
 
-        for (x, y, width, height, page_index) in &selections {
-            self.render_buffer.write_selection(*x, *y, *width, *height, *page_index);
-        }
-
-        // Selection count is automatically tracked and written in finalize()
         self.render_buffer.finalize();
     }
 
@@ -335,6 +343,56 @@ impl WasmEditor {
     #[wasm_bindgen(js_name = getTextLen)]
     pub fn get_text_len(&self) -> u32 {
         self.render_buffer.text_len()
+    }
+
+    /// Get pointer to style buffer
+    #[wasm_bindgen(js_name = getStylePtr)]
+    pub fn get_style_ptr(&self) -> u32 {
+        self.render_buffer.style_ptr()
+    }
+
+    /// Get length of style buffer
+    #[wasm_bindgen(js_name = getStyleLen)]
+    pub fn get_style_len(&self) -> u32 {
+        self.render_buffer.style_len()
+    }
+
+    // =========================================================================
+    // Font and Formatting
+    // =========================================================================
+
+    /// Register a font with metrics
+    #[wasm_bindgen(js_name = addFont)]
+    pub fn add_font(&mut self, font_id: u32, line_height: f32, char_widths: &[f32], default_width: f32) {
+        let metrics = crate::layout::FontMetrics::new(
+            line_height,
+            char_widths.to_vec(),
+            default_width,
+        );
+        self.editor.layout.font_library.set(crate::layout::font::FontId(font_id), metrics);
+        
+         // Full relayout (since we don't know where this font is used, safest)
+        self.editor.layout.invalidate_all();
+        self.editor.mark_dirty();
+        self.editor.update_layout();
+    }
+
+    /// Format current selection with a font
+    #[wasm_bindgen(js_name = formatSelection)]
+    pub fn format_selection(&mut self, font_id: u32) {
+        if let Some(selection) = &self.editor.selection {
+             let start = selection.start();
+             let end = selection.end();
+             
+             let start_offset = self.editor.document.position_to_offset(&start);
+             let end_offset = self.editor.document.position_to_offset(&end);
+             
+             let diff = self.editor.document.format_range(start_offset, end_offset, crate::layout::font::FontId(font_id));
+             
+             // Invalidate layout
+             self.editor.layout.invalidate(&diff);
+             self.editor.update_layout();
+        }
     }
 
     // =========================================================================
@@ -398,6 +456,140 @@ impl WasmEditor {
     #[wasm_bindgen(js_name = hasSelection)]
     pub fn has_selection(&self) -> bool {
         self.editor.selection.is_some()
+    }
+
+    // =========================================================================
+    // Mouse Interaction
+    // =========================================================================
+
+    /// Set cursor position from page coordinates
+    #[wasm_bindgen(js_name = setCursor)]
+    pub fn set_cursor(&mut self, page_index: usize, x: f32, y: f32) {
+        if let Some(pos) = self.hit_test(page_index, x, y) {
+            self.editor.cursor = crate::editing::Cursor::new(pos);
+            self.editor.selection = None;
+            self.editor.update_layout();
+        }
+    }
+
+    /// Extend selection to position from page coordinates
+    #[wasm_bindgen(js_name = selectTo)]
+    pub fn select_to(&mut self, page_index: usize, x: f32, y: f32) {
+        if let Some(pos) = self.hit_test(page_index, x, y) {
+            let anchor = if let Some(sel) = &self.editor.selection {
+                sel.anchor
+            } else {
+                self.editor.cursor.position
+            };
+            
+            self.editor.cursor = crate::editing::Cursor::new(pos);
+            self.editor.selection = Some(crate::editing::Selection::new(anchor, pos));
+            self.editor.update_layout();
+        }
+    }
+
+    /// Helper: Map page coordinates to document position
+    fn hit_test(&self, page_index: usize, x: f32, y: f32) -> Option<crate::editing::DocPosition> {
+        let pages = self.editor.layout.pages();
+        if page_index >= pages.len() {
+            return None;
+        }
+        
+        let page = &pages[page_index];
+        let constraints = self.editor.layout.constraints();
+        let document = &self.editor.document;
+        let layout = &self.editor.layout;
+        
+        let mut current_y = constraints.margin_top;
+        
+        // Iterate through paragraphs on this page (logic modified from DisplayList::build)
+        let mut in_page = false;
+        
+        // If y is above top margin, clamp to first line
+        if y < current_y {
+            // Find start para/line
+            let para_id = page.start_para;
+            let para_layout = layout.paragraph_layout(para_id)?;
+            let line = &para_layout.lines[page.start_line];
+            let indent = layout.indent_for(document.block_meta(para_id)?);
+            let offset = line.offset_for_x(x - constraints.margin_left - indent);
+            return Some(crate::editing::DocPosition::new(para_id, offset));
+        }
+
+        for para_id in document.paragraph_order() {
+            if para_id == page.start_para {
+                in_page = true;
+            }
+
+            if !in_page {
+                continue;
+            }
+
+            if let Some(para_layout) = layout.paragraph_layout(para_id) {
+                let start_line = if para_id == page.start_para {
+                    page.start_line
+                } else {
+                    0
+                };
+
+                let end_line = if para_id == page.end_para {
+                    page.end_line + 1
+                } else {
+                    para_layout.lines.len()
+                };
+
+                let indent = if let Some(meta) = document.block_meta(para_id) {
+                    layout.indent_for(meta)
+                } else {
+                    0.0
+                };
+
+                for line_idx in start_line..end_line.min(para_layout.lines.len()) {
+                    let line = &para_layout.lines[line_idx];
+                    let line_bottom = current_y + line.height;
+                    
+                    // Check if Y is in this line (or if we are at the last line of the page and Y is below)
+                    let is_last_line_on_page = para_id == page.end_para && line_idx == page.end_line;
+                    
+                    if y < line_bottom || is_last_line_on_page {
+                        // Found line (or clamped to last line)
+                        // Adjust X for margins and indent
+                        let local_x = x - constraints.margin_left - indent;
+                        let offset = line.offset_for_x(local_x);
+                        return Some(crate::editing::DocPosition::new(para_id, offset));
+                    }
+
+                    current_y += line.height;
+                }
+                
+                // If we finished this paragraph (processed all lines), add spacing
+                if end_line >= para_layout.lines.len() {
+                    if let Some(meta) = document.block_meta(para_id) {
+                         current_y += meta.kind.spacing_after() * 16.0;
+                    }
+                }
+            }
+
+            if para_id == page.end_para {
+                break;
+            }
+        }
+        
+        // Should have returned by now if logic is correct, but fallback to end of page
+        let end_para = page.end_para;
+        let end_line_idx = page.end_line;
+        if let Some(pl) = layout.paragraph_layout(end_para) {
+            let line = &pl.lines[end_line_idx];
+             let indent = if let Some(meta) = document.block_meta(end_para) {
+                layout.indent_for(meta)
+            } else {
+                0.0
+            };
+            let offset = line.offset_for_x(x - constraints.margin_left - indent);
+            return Some(crate::editing::DocPosition::new(end_para, offset));
+        }
+
+        None
     }
 }
 
