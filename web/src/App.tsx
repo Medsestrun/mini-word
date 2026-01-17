@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useLayoutEffect } from 'react';
 import './App.css';
 import {
   type RenderData,
@@ -550,6 +550,72 @@ interface PageProps {
   pageGap: number;
 }
 
+/**
+ * Compute cursor X position using browser's DOM Range API
+ * This ensures cursor position matches browser-rendered text exactly
+ */
+const computeCursorX = (cursor: CursorRenderData, page: PageRenderData, scale: number): number => {
+  // Find the line containing the cursor by matching Y position
+  let targetLineIndex = -1;
+  const lineHeight = 14 * 1.2; // font-size * line-height
+  
+  for (let i = 0; i < page.lines.length; i++) {
+    const line = page.lines[i];
+    if (cursor.y >= line.y && cursor.y < line.y + lineHeight) {
+      targetLineIndex = i;
+      break;
+    }
+  }
+
+  // Fallback to line X if line not found
+  if (targetLineIndex === -1) {
+    return page.lines[0]?.x ?? 0;
+  }
+
+  const line = page.lines[targetLineIndex];
+  
+  // Find the DOM element for this line
+  const lineElement = document.querySelector(
+    `[data-page-index="${page.pageIndex}"][data-line-index="${targetLineIndex}"]`
+  ) as HTMLElement;
+  
+  if (!lineElement) {
+    return line.x;
+  }
+
+  // Handle empty line or offset at start
+  if (cursor.utf16OffsetInLine === 0 || !line.text) {
+    return line.x;
+  }
+
+  // Find the text node (skip list marker span if present)
+  let textNode: Text | null = null;
+  for (let i = 0; i < lineElement.childNodes.length; i++) {
+    const node = lineElement.childNodes[i];
+    if (node.nodeType === Node.TEXT_NODE) {
+      textNode = node as Text;
+      break;
+    }
+  }
+  
+  if (!textNode) {
+    return line.x;
+  }
+
+  // Clamp offset to text length
+  const offset = Math.min(cursor.utf16OffsetInLine, textNode.length);
+
+  const range = document.createRange();
+  range.setStart(textNode, 0);
+  range.setEnd(textNode, offset);
+  
+  const rect = range.getBoundingClientRect();
+  
+  // rect.width is the width from start of text to cursor offset in scaled pixels
+  // Convert back to unscaled coordinates by dividing by scale
+  return line.x + rect.width / scale;
+};
+
 function Page({
   page,
   constraints,
@@ -560,10 +626,19 @@ function Page({
   pageGap,
 }: PageProps) {
   const pageTop = page.pageIndex * (constraints.pageHeight + pageGap) * scale + pageGap;
+  const [cursorX, setCursorX] = useState(0);
 
-  // Use Rust-calculated cursor X position
-  // Rust handles text measurement using its layout engine
-  const cursorX = cursor?.x ?? 0;
+  // Compute cursor X position after DOM updates using useLayoutEffect
+  // This ensures the DOM has the latest text before we measure
+  useLayoutEffect(() => {
+    if (cursor) {
+      const x = computeCursorX(cursor, page, scale);
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setCursorX(x);
+    } else {
+      setCursorX(0);
+    }
+  }, [cursor, page, scale]);
 
   return (
     <div
@@ -602,7 +677,9 @@ function Page({
       {page.lines.map((line, i) => (
         <TextLine 
           key={i} 
-          line={line} 
+          line={line}
+          lineIndex={i}
+          pageIndex={page.pageIndex}
           scale={scale}
         />
       ))}
@@ -644,11 +721,12 @@ function Page({
 
 interface TextLineProps {
   line: LineRenderData;
+  lineIndex: number;
+  pageIndex: number;
   scale: number;
 }
 
-const TextLine = ({ line, scale }: TextLineProps) => {
-  console.log('scale', scale);
+const TextLine = ({ line, lineIndex, pageIndex, scale }: TextLineProps) => {
   const getFontSize = () => {
     if (line.isHeading && line.headingLevel) {
       const sizes: Record<number, number> = {
@@ -672,6 +750,8 @@ const TextLine = ({ line, scale }: TextLineProps) => {
   return (
     <div
       className="text-line"
+      data-page-index={pageIndex}
+      data-line-index={lineIndex}
       style={{
         position: 'absolute',
         left: line.x * scale,
