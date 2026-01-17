@@ -115,6 +115,14 @@ html, body, #root {
   padding-bottom: 40px;
 }
 
+/* Input layer - contenteditable overlay for native text input */
+.input-layer {
+}
+
+.input-layer:focus {
+  outline: none;
+}
+
 /* Page styling */
 .page {
   overflow: hidden;
